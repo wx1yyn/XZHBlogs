@@ -1,0 +1,2349 @@
+---
+layout: post
+title: "RunLoop"
+date: 2015-01-03 23:31:26 +0800
+comments: true
+categories: 
+---
+
+##之前看到关于RunLoop的一些使用
+
+在AFNetworking源码中，看到过在一个`单独NSThread子线程上`首先`[runloop start];`开启runloop，然后上添加`-[NSURLConnection对象 sceduleInRunLoop:runloop对象 ....]` 来调度接收NSURLConnection事件源，最后处理NSURLConnection的回调。
+
+但是后来发现最终的网络数据请求是在`苹果系统内部的单独的子线程`上完成CFSocket相关操作，而且还有两个系统子线程:
+	
+- (1) `com.apple.CFSocket.private` 子线程 >>> 完成最终的网络数据交换
+
+- (2) `com.apple.NSURLConnectionLoader` 子线程 >>> 负责向其他线程发送事件源，多线程之间的通信
+
+我就有个小疑问，那最终网络数据请求是在苹果的内部子线完成，那么是如何回调通知App程序中我们的用户线程了？
+
+如果已经知道这个实现的原理，我觉得已经对runloop了解很渗透了，可惜我是小白，真的是一窍不通。
+
+本篇文章，主要学习自YYKit大神的runloop讲解的博客文章。如果需要深度学习runloop相关，请直接到YYKit大神的博客去仔细看这一片文章即可，就没必要在这里浪费时间看我这些二逼的笔记了....
+
+****
+
+##先不急着说runloop是什么，首先看下对于一个线程使用场景的分类
+
+### 一次性 的线程对象
+
+- (1) 使用默认的方法创建出来的线程对象，都只能`执行一次`任务代码
+- (2) 当一次性任务执行`完毕`之后，线程对象就会`被系统释放`所占用的内存资源
+
+### 永久存活（常驻内存） 的线程对象
+
+- (1) 有时候需要一个永久存活在后台的线程对象，为App程序在整个运行期间提供一些特定的数据服务、后台定时任务代码等等。
+- (2) 也就是说要让这个线程能`随时处理事件`、`无限次处理事件`、而且`不能让线程对象退出执行`
+- (3) 就是只要`App程序进程`存在，那么就一直让这个线程存活，随时等待执行任务
+
+###如果将一个线程做成单例一直存活在内存，这就OK了吗？
+
+肯定是不行的，这样可能会导致这个线程一直占有CPU时间。但其实这个线程并没有做任何的事情，但就是要一直占有CPU时间。因为他时时刻刻都在运行，并不知道什么该执行，什么时候该休息一下，以便浪费CPU时间。
+
+那么解决这个情况，就是`事件循环`的概念了。
+
+###如果希望实现 `永久存活的线程对象`，但是又不希望一直占有CPU时间， 就需要一种类似 `事件循环（Event Loop）` 这样的机制
+
+windows系统与iOS/MaxOSX系统都有这个机制，只是叫法不同:
+
+- (1) windows系统中，使用的是 `消息循环（Message Loop）`
+- (2) iOS/MaxOSX系统中，使用的是 `运行循环（Run Loop）`
+
+不管他叫什么，但二者都是表达一个东西就是`事件循环`，那么事件循环的核心点:
+
+- (1) 如何 接收/调度/处理 事件/消息
+- (2) 如何让 线程在 `没有处理消息`时`休眠`线程以避免资源占用、在`有消息`到来时立刻`唤醒`线程
+
+那么可以将`事件循环`看做成一个`组件`，专门用来`辅助某一个线程对象`来完成如下事情，并且可以让`线程对象不会退出`执行:
+
+- (1) 等待`接收`要处理的事件
+- (2) 接收到事件后，`唤醒`线程去处理事件
+- (3) 无事件或处理完毕之后，`休眠`线程节省CPU占用资源，但不会退出
+
+
+默认情况下，我们使用系统的方式创建出来的线程对象都是`一次性`的，而只有手动开启`事件循环`的线程对象才会具备上面的这些功能。但是注意，`主线程`对象默认就是开启事件循环的。
+
+而在iOS/MacOSX系统中，提供事件循环功能实现的组件或类叫做RunLoop:
+
+- (1) iOS系统、Objective-C Foundation版本 >>> `NSRunLoop` >>> `非线程安全`
+- (2) MacOS系统、Core Foundation版本 >>> `__CFRunLoop` >>> `线程安全`
+
+***
+
+###查看App进程启动后，主线程的RunLoop对象的所有数据
+
+```objc
+@implementation ViewController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+ 	
+ 	NSRunLoop *runloop = [NSRunLoop currentRunLoop];
+    NSLog(@"");   
+}
+```
+
+断点`po runloop`得到如下
+
+```
+(lldb) po runloop
+<CFRunLoop 0x7fc3995039e0 [0x107f02a40]>{wakeup port = 0xd03, stopped = false, ignoreWakeUps = true, 
+current mode = UIInitializationRunLoopMode,
+common modes = <CFBasicHash 0x7fc399500890 [0x107f02a40]>{type = mutable set, count = 2,
+entries =>
+	0 : <CFString 0x10684b210 [0x107f02a40]>{contents = "UITrackingRunLoopMode"}
+	2 : <CFString 0x107f235e0 [0x107f02a40]>{contents = "kCFRunLoopDefaultMode"}
+}
+,
+common mode items = <CFBasicHash 0x7fc399501890 [0x107f02a40]>{type = mutable set, count = 18,
+entries =>
+	0 : <CFRunLoopSource 0x7fc3995138f0 [0x107f02a40]>{signalled = No, valid = Yes, order = -1, context = <CFRunLoopSource context>{version = 0, info = 0x0, callout = PurpleEventSignalCallback (0x10b7e9779)}}
+	1 : <CFRunLoopObserver 0x7fc399712230 [0x107f02a40]>{valid = Yes, activities = 0x20, repeats = Yes, order = 0, callout = _UIGestureRecognizerUpdateObserver (0x105f8a41f), context = <CFRunLoopObserver context 0x0>}
+	2 : <CFRunLoopObserver 0x7fc39951fd30 [0x107f02a40]>{valid = Yes, activities = 0x20, repeats = No, order = 0, callout = _runLoopObserverWithBlockContext (0x107c00150), context = <CFRunLoopObserver context 0x7fc399511530>}
+	3 : <CFRunLoopObserver 0x7fc399507310 [0x107f02a40]>{valid = Yes, activities = 0xa0, repeats = Yes, order = 2147483647, callout = _wrapRunLoopWithAutoreleasePoolHandler (0x105a9b4c2), context = <CFArray 0x7fc3995060b0 [0x107f02a40]>{type = mutable-small, count = 0, values = ()}}
+	5 : <CFRunLoopSource 0x7fc3995122a0 [0x107f02a40]>{signalled = No, valid = Yes, order = 0, context = <CFMachPort 0x7fc399409670 [0x107f02a40]>{valid = Yes, port = 2703, source = 0x7fc3995122a0, callout = __IOHIDEventSystemClientQueueCallback (0x10b83a293), context = <CFMachPort context 0x7fc399706d10>}}
+	6 : <CFRunLoopObserver 0x7fc399411880 [0x107f02a40]>{valid = Yes, activities = 0xa0, repeats = Yes, order = 2000000, callout = _ZN2CA11Transaction17observer_callbackEP19__CFRunLoopObservermPv (0x108d1479c), context = <CFRunLoopObserver context 0x0>}
+	7 : <CFRunLoopSource 0x7fc39950a5d0 [0x107f02a40]>{signalled = No, valid = Yes, order = 0, context = <CFRunLoopSource MIG Server> {port = 13071, subsystem = 0x10681c8b0, context = 0x0}}
+	8 : <CFRunLoopSource 0x7fc399513570 [0x107f02a40]>{signalled = No, valid = Yes, order = 0, context = <CFMachPort 0x7fc399409a50 [0x107f02a40]>{valid = Yes, port = 2803, source = 0x7fc399513570, callout = __IOHIDEventSystemClientAvailabilityCallback (0x10b83a444), context = <CFMachPort context 0x7fc399706d10>}}
+	10 : <CFRunLoopSource 0x7fc399507470 [0x107f02a40]>{signalled = No, valid = Yes, order = -1, context = <CFRunLoopSource context>{version = 0, info = 0x7fc39940a300, callout = _UIApplicationHandleEventQueue (0x105a9bb4f)}}
+	11 : <CFRunLoopObserver 0x7fc399506290 [0x107f02a40]>{valid = Yes, activities = 0xa0, repeats = Yes, order = 2001000, callout = _afterCACommitHandler (0x105acf0ed), context = <CFRunLoopObserver context 0x7fc39940a300>}
+	12 : <CFRunLoopSource 0x7fc39950e1f0 [0x107f02a40]>{signalled = No, valid = Yes, order = 0, context = <CFRunLoopSource MIG Server> {port = 19723, subsystem = 0x10d8cdfe0, context = 0x7fc39940b4e0}}
+	13 : <CFRunLoopObserver 0x7fc3995069f0 [0x107f02a40]>{valid = Yes, activities = 0x1, repeats = Yes, order = -2147483647, callout = _wrapRunLoopWithAutoreleasePoolHandler (0x105a9b4c2), context = <CFArray 0x7fc3995060b0 [0x107f02a40]>{type = mutable-small, count = 0, values = ()}}
+	15 : <CFRunLoopSource 0x7fc39940fd70 [0x107f02a40]>{signalled = No, valid = Yes, order = 0, context = <CFRunLoopSource MIG Server> {port = 17679, subsystem = 0x10682f9f0, context = 0x7fc399414a50}}
+	17 : <CFRunLoopSource 0x7fc399504da0 [0x107f02a40]>{signalled = No, valid = Yes, order = 0, context = <CFMachPort 0x7fc399500950 [0x107f02a40]>{valid = Yes, port = b07, source = 0x7fc399504da0, callout = _ZL20notify_port_callbackP12__CFMachPortPvlS1_ (0x108d24a11), context = <CFMachPort context 0x0>}}
+	19 : <CFRunLoopSource 0x7fc39960b580 [0x107f02a40]>{signalled = Yes, valid = Yes, order = 0, context = <CFRunLoopSource context>{version = 0, info = 0x7fc399606880, callout = FBSSerialQueueRunLoopSourceHandler (0x10bca8f5b)}}
+	20 : <CFRunLoopSource 0x7fc399409d70 [0x107f02a40]>{signalled = No, valid = Yes, order = -1, context = <CFRunLoopSource context>{version = 1, info = 0x2c03, callout = PurpleEventCallback (0x10b7ebcb0)}}
+	21 : <CFRunLoopObserver 0x7fc399507ed0 [0x107f02a40]>{valid = Yes, activities = 0xa0, repeats = Yes, order = 1999000, callout = _beforeCACommitHandler (0x105acf0a8), context = <CFRunLoopObserver context 0x7fc39940a300>}
+	22 : <CFRunLoopSource 0x7fc399513630 [0x107f02a40]>{signalled = No, valid = Yes, order = 1, context = <CFMachPort 0x7fc399409560 [0x107f02a40]>{valid = Yes, port = 2503, source = 0x7fc399513630, callout = __IOMIGMachPortPortCallback (0x10b842a01), context = <CFMachPort context 0x7fc399404f90>}}
+}
+,
+modes = <CFBasicHash 0x7fc399502da0 [0x107f02a40]>{type = mutable set, count = 5,
+entries =>
+	2 : <CFRunLoopMode 0x7fc3997043c0 [0x107f02a40]>{name = UITrackingRunLoopMode, port set = 0x2103, timer port = 0x2203, 
+	sources0 = <CFBasicHash 0x7fc399708c20 [0x107f02a40]>{type = mutable set, count = 3,
+entries =>
+	0 : <CFRunLoopSource 0x7fc3995138f0 [0x107f02a40]>{signalled = No, valid = Yes, order = -1, context = <CFRunLoopSource context>{version = 0, info = 0x0, callout = PurpleEventSignalCallback (0x10b7e9779)}}
+	1 : <CFRunLoopSource 0x7fc399507470 [0x107f02a40]>{signalled = No, valid = Yes, order = -1, context = <CFRunLoopSource context>{version = 0, info = 0x7fc39940a300, callout = _UIApplicationHandleEventQueue (0x105a9bb4f)}}
+	2 : <CFRunLoopSource 0x7fc39960b580 [0x107f02a40]>{signalled = Yes, valid = Yes, order = 0, context = <CFRunLoopSource context>{version = 0, info = 0x7fc399606880, callout = FBSSerialQueueRunLoopSourceHandler (0x10bca8f5b)}}
+}
+,
+	sources1 = <CFBasicHash 0x7fc399708c60 [0x107f02a40]>{type = mutable set, count = 8,
+entries =>
+	0 : <CFRunLoopSource 0x7fc39940fd70 [0x107f02a40]>{signalled = No, valid = Yes, order = 0, context = <CFRunLoopSource MIG Server> {port = 17679, subsystem = 0x10682f9f0, context = 0x7fc399414a50}}
+	2 : <CFRunLoopSource 0x7fc399504da0 [0x107f02a40]>{signalled = No, valid = Yes, order = 0, context = <CFMachPort 0x7fc399500950 [0x107f02a40]>{valid = Yes, port = b07, source = 0x7fc399504da0, callout = _ZL20notify_port_callbackP12__CFMachPortPvlS1_ (0x108d24a11), context = <CFMachPort context 0x0>}}
+	3 : <CFRunLoopSource 0x7fc3995122a0 [0x107f02a40]>{signalled = No, valid = Yes, order = 0, context = <CFMachPort 0x7fc399409670 [0x107f02a40]>{valid = Yes, port = 2703, source = 0x7fc3995122a0, callout = __IOHIDEventSystemClientQueueCallback (0x10b83a293), context = <CFMachPort context 0x7fc399706d10>}}
+	4 : <CFRunLoopSource 0x7fc39950e1f0 [0x107f02a40]>{signalled = No, valid = Yes, order = 0, context = <CFRunLoopSource MIG Server> {port = 19723, subsystem = 0x10d8cdfe0, context = 0x7fc39940b4e0}}
+	6 : <CFRunLoopSource 0x7fc39950a5d0 [0x107f02a40]>{signalled = No, valid = Yes, order = 0, context = <CFRunLoopSource MIG Server> {port = 13071, subsystem = 0x10681c8b0, context = 0x0}}
+	9 : <CFRunLoopSource 0x7fc399409d70 [0x107f02a40]>{signalled = No, valid = Yes, order = -1, context = <CFRunLoopSource context>{version = 1, info = 0x2c03, callout = PurpleEventCallback (0x10b7ebcb0)}}
+	11 : <CFRunLoopSource 0x7fc399513630 [0x107f02a40]>{signalled = No, valid = Yes, order = 1, context = <CFMachPort 0x7fc399409560 [0x107f02a40]>{valid = Yes, port = 2503, source = 0x7fc399513630, callout = __IOMIGMachPortPortCallback (0x10b842a01), context = <CFMachPort context 0x7fc399404f90>}}
+	12 : <CFRunLoopSource 0x7fc399513570 [0x107f02a40]>{signalled = No, valid = Yes, order = 0, context = <CFMachPort 0x7fc399409a50 [0x107f02a40]>{valid = Yes, port = 2803, source = 0x7fc399513570, callout = __IOHIDEventSystemClientAvailabilityCallback (0x10b83a444), context = <CFMachPort context 0x7fc399706d10>}}
+}
+,
+	observers = <CFArray 0x7fc399509550 [0x107f02a40]>{type = mutable-small, count = 7, values = (
+	0 : <CFRunLoopObserver 0x7fc3995069f0 [0x107f02a40]>{valid = Yes, activities = 0x1, repeats = Yes, order = -2147483647, callout = _wrapRunLoopWithAutoreleasePoolHandler (0x105a9b4c2), context = <CFArray 0x7fc3995060b0 [0x107f02a40]>{type = mutable-small, count = 0, values = ()}}
+	1 : <CFRunLoopObserver 0x7fc399712230 [0x107f02a40]>{valid = Yes, activities = 0x20, repeats = Yes, order = 0, callout = _UIGestureRecognizerUpdateObserver (0x105f8a41f), context = <CFRunLoopObserver context 0x0>}
+	2 : <CFRunLoopObserver 0x7fc39951fd30 [0x107f02a40]>{valid = Yes, activities = 0x20, repeats = No, order = 0, callout = _runLoopObserverWithBlockContext (0x107c00150), context = <CFRunLoopObserver context 0x7fc399511530>}
+	3 : <CFRunLoopObserver 0x7fc399507ed0 [0x107f02a40]>{valid = Yes, activities = 0xa0, repeats = Yes, order = 1999000, callout = _beforeCACommitHandler (0x105acf0a8), context = <CFRunLoopObserver context 0x7fc39940a300>}
+	4 : <CFRunLoopObserver 0x7fc399411880 [0x107f02a40]>{valid = Yes, activities = 0xa0, repeats = Yes, order = 2000000, callout = _ZN2CA11Transaction17observer_callbackEP19__CFRunLoopObservermPv (0x108d1479c), context = <CFRunLoopObserver context 0x0>}
+	5 : <CFRunLoopObserver 0x7fc399506290 [0x107f02a40]>{valid = Yes, activities = 0xa0, repeats = Yes, order = 2001000, callout = _afterCACommitHandler (0x105acf0ed), context = <CFRunLoopObserver context 0x7fc39940a300>}
+	6 : <CFRunLoopObserver 0x7fc399507310 [0x107f02a40]>{valid = Yes, activities = 0xa0, repeats = Yes, order = 2147483647, callout = _wrapRunLoopWithAutoreleasePoolHandler (0x105a9b4c2), context = <CFArray 0x7fc3995060b0 [0x107f02a40]>{type = mutable-small, count = 0, values = ()}}
+)},
+	timers = (null),
+	currently 492079227 (22502348759133) / soft deadline in: 1.84467216e+10 sec (@ -1) / hard deadline in: 1.84467216e+10 sec (@ -1)
+},
+
+	3 : <CFRunLoopMode 0x7fc3995139b0 [0x107f02a40]>{name = GSEventReceiveRunLoopMode, port set = 0x2a03, timer port = 0x2b03, 
+	sources0 = <CFBasicHash 0x7fc399512180 [0x107f02a40]>{type = mutable set, count = 1,
+entries =>
+	0 : <CFRunLoopSource 0x7fc3995138f0 [0x107f02a40]>{signalled = No, valid = Yes, order = -1, context = <CFRunLoopSource context>{version = 0, info = 0x0, callout = PurpleEventSignalCallback (0x10b7e9779)}}
+}
+,
+	sources1 = <CFBasicHash 0x7fc399513a60 [0x107f02a40]>{type = mutable set, count = 1,
+entries =>
+	2 : <CFRunLoopSource 0x7fc399409e30 [0x107f02a40]>{signalled = No, valid = Yes, order = -1, context = <CFRunLoopSource context>{version = 1, info = 0x2c03, callout = PurpleEventCallback (0x10b7ebcb0)}}
+}
+,
+	observers = (null),
+	timers = (null),
+	currently 492079227 (22502349454219) / soft deadline in: 1.84467216e+10 sec (@ -1) / hard deadline in: 1.84467216e+10 sec (@ -1)
+},
+
+	4 : <CFRunLoopMode 0x7fc399503cb0 [0x107f02a40]>{name = kCFRunLoopDefaultMode, port set = 0xe03, timer port = 0xf03, 
+	sources0 = <CFBasicHash 0x7fc399500a30 [0x107f02a40]>{type = mutable set, count = 3,
+entries =>
+	0 : <CFRunLoopSource 0x7fc3995138f0 [0x107f02a40]>{signalled = No, valid = Yes, order = -1, context = <CFRunLoopSource context>{version = 0, info = 0x0, callout = PurpleEventSignalCallback (0x10b7e9779)}}
+	1 : <CFRunLoopSource 0x7fc399507470 [0x107f02a40]>{signalled = No, valid = Yes, order = -1, context = <CFRunLoopSource context>{version = 0, info = 0x7fc39940a300, callout = _UIApplicationHandleEventQueue (0x105a9bb4f)}}
+	2 : <CFRunLoopSource 0x7fc39960b580 [0x107f02a40]>{signalled = Yes, valid = Yes, order = 0, context = <CFRunLoopSource context>{version = 0, info = 0x7fc399606880, callout = FBSSerialQueueRunLoopSourceHandler (0x10bca8f5b)}}
+}
+,
+	sources1 = <CFBasicHash 0x7fc399500710 [0x107f02a40]>{type = mutable set, count = 8,
+entries =>
+	0 : <CFRunLoopSource 0x7fc39940fd70 [0x107f02a40]>{signalled = No, valid = Yes, order = 0, context = <CFRunLoopSource MIG Server> {port = 17679, subsystem = 0x10682f9f0, context = 0x7fc399414a50}}
+	2 : <CFRunLoopSource 0x7fc399504da0 [0x107f02a40]>{signalled = No, valid = Yes, order = 0, context = <CFMachPort 0x7fc399500950 [0x107f02a40]>{valid = Yes, port = b07, source = 0x7fc399504da0, callout = _ZL20notify_port_callbackP12__CFMachPortPvlS1_ (0x108d24a11), context = <CFMachPort context 0x0>}}
+	3 : <CFRunLoopSource 0x7fc3995122a0 [0x107f02a40]>{signalled = No, valid = Yes, order = 0, context = <CFMachPort 0x7fc399409670 [0x107f02a40]>{valid = Yes, port = 2703, source = 0x7fc3995122a0, callout = __IOHIDEventSystemClientQueueCallback (0x10b83a293), context = <CFMachPort context 0x7fc399706d10>}}
+	4 : <CFRunLoopSource 0x7fc39950e1f0 [0x107f02a40]>{signalled = No, valid = Yes, order = 0, context = <CFRunLoopSource MIG Server> {port = 19723, subsystem = 0x10d8cdfe0, context = 0x7fc39940b4e0}}
+	6 : <CFRunLoopSource 0x7fc39950a5d0 [0x107f02a40]>{signalled = No, valid = Yes, order = 0, context = <CFRunLoopSource MIG Server> {port = 13071, subsystem = 0x10681c8b0, context = 0x0}}
+	9 : <CFRunLoopSource 0x7fc399409d70 [0x107f02a40]>{signalled = No, valid = Yes, order = -1, context = <CFRunLoopSource context>{version = 1, info = 0x2c03, callout = PurpleEventCallback (0x10b7ebcb0)}}
+	11 : <CFRunLoopSource 0x7fc399513630 [0x107f02a40]>{signalled = No, valid = Yes, order = 1, context = <CFMachPort 0x7fc399409560 [0x107f02a40]>{valid = Yes, port = 2503, source = 0x7fc399513630, callout = __IOMIGMachPortPortCallback (0x10b842a01), context = <CFMachPort context 0x7fc399404f90>}}
+	12 : <CFRunLoopSource 0x7fc399513570 [0x107f02a40]>{signalled = No, valid = Yes, order = 0, context = <CFMachPort 0x7fc399409a50 [0x107f02a40]>{valid = Yes, port = 2803, source = 0x7fc399513570, callout = __IOHIDEventSystemClientAvailabilityCallback (0x10b83a444), context = <CFMachPort context 0x7fc399706d10>}}
+}
+,
+	observers = <CFArray 0x7fc39950a470 [0x107f02a40]>{type = mutable-small, count = 7, values = (
+	0 : <CFRunLoopObserver 0x7fc3995069f0 [0x107f02a40]>{valid = Yes, activities = 0x1, repeats = Yes, order = -2147483647, callout = _wrapRunLoopWithAutoreleasePoolHandler (0x105a9b4c2), context = <CFArray 0x7fc3995060b0 [0x107f02a40]>{type = mutable-small, count = 0, values = ()}}
+	1 : <CFRunLoopObserver 0x7fc399712230 [0x107f02a40]>{valid = Yes, activities = 0x20, repeats = Yes, order = 0, callout = _UIGestureRecognizerUpdateObserver (0x105f8a41f), context = <CFRunLoopObserver context 0x0>}
+	2 : <CFRunLoopObserver 0x7fc39951fd30 [0x107f02a40]>{valid = Yes, activities = 0x20, repeats = No, order = 0, callout = _runLoopObserverWithBlockContext (0x107c00150), context = <CFRunLoopObserver context 0x7fc399511530>}
+	3 : <CFRunLoopObserver 0x7fc399507ed0 [0x107f02a40]>{valid = Yes, activities = 0xa0, repeats = Yes, order = 1999000, callout = _beforeCACommitHandler (0x105acf0a8), context = <CFRunLoopObserver context 0x7fc39940a300>}
+	4 : <CFRunLoopObserver 0x7fc399411880 [0x107f02a40]>{valid = Yes, activities = 0xa0, repeats = Yes, order = 2000000, callout = _ZN2CA11Transaction17observer_callbackEP19__CFRunLoopObservermPv (0x108d1479c), context = <CFRunLoopObserver context 0x0>}
+	5 : <CFRunLoopObserver 0x7fc399506290 [0x107f02a40]>{valid = Yes, activities = 0xa0, repeats = Yes, order = 2001000, callout = _afterCACommitHandler (0x105acf0ed), context = <CFRunLoopObserver context 0x7fc39940a300>}
+	6 : <CFRunLoopObserver 0x7fc399507310 [0x107f02a40]>{valid = Yes, activities = 0xa0, repeats = Yes, order = 2147483647, callout = _wrapRunLoopWithAutoreleasePoolHandler (0x105a9b4c2), context = <CFArray 0x7fc3995060b0 [0x107f02a40]>{type = mutable-small, count = 0, values = ()}}
+)},
+	timers = <CFArray 0x7fc399412620 [0x107f02a40]>{type = mutable-small, count = 1, values = (
+	0 : <CFRunLoopTimer 0x7fc399412720 [0x107f02a40]>{valid = Yes, firing = No, interval = 0, tolerance = 0, next fire date = 492079211 (-16.303431 @ 22486046916665), callout = (Delayed Perform) UIApplication _accessibilitySetUpQuickSpeak (0x105255137 / 0x105ece256) (/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator.sdk/System/Library/Frameworks/UIKit.framework/UIKit), context = <CFRunLoopTimer context 0x7fc3995105c0>}
+)},
+	currently 492079227 (22502349487933) / soft deadline in: 1.84467441e+10 sec (@ 22486046916665) / hard deadline in: 1.84467441e+10 sec (@ 22486046916665)
+},
+
+	5 : <CFRunLoopMode 0x7fc399708610 [0x107f02a40]>{name = UIInitializationRunLoopMode, port set = 0x2f13, timer port = 0x300b, 
+	sources0 = <CFBasicHash 0x7fc399708700 [0x107f02a40]>{type = mutable set, count = 1,
+entries =>
+	2 : <CFRunLoopSource 0x7fc39960b580 [0x107f02a40]>{signalled = Yes, valid = Yes, order = 0, context = <CFRunLoopSource context>{version = 0, info = 0x7fc399606880, callout = FBSSerialQueueRunLoopSourceHandler (0x10bca8f5b)}}
+}
+,
+	sources1 = <CFBasicHash 0x7fc399708740 [0x107f02a40]>{type = mutable set, count = 0,
+entries =>
+}
+,
+	observers = <CFArray 0x7fc3994079f0 [0x107f02a40]>{type = mutable-small, count = 1, values = (
+	0 : <CFRunLoopObserver 0x7fc399411880 [0x107f02a40]>{valid = Yes, activities = 0xa0, repeats = Yes, order = 2000000, callout = _ZN2CA11Transaction17observer_callbackEP19__CFRunLoopObservermPv (0x108d1479c), context = <CFRunLoopObserver context 0x0>}
+)},
+	timers = (null),
+	currently 492079227 (22502350502481) / soft deadline in: 1.84467216e+10 sec (@ -1) / hard deadline in: 1.84467216e+10 sec (@ -1)
+},
+
+	6 : <CFRunLoopMode 0x7fc399522e60 [0x107f02a40]>{name = kCFRunLoopCommonModes, port set = 0x3b07, timer port = 0x3d03, 
+	sources0 = (null),
+	sources1 = (null),
+	observers = (null),
+	timers = (null),
+	currently 492079227 (22502350560457) / soft deadline in: 1.84467216e+10 sec (@ -1) / hard deadline in: 1.84467216e+10 sec (@ -1)
+},
+
+}
+}
+
+
+(lldb) 
+```
+
+可能上述输出内容比较多，可以按如下格式去参看对应的部分:
+
+```c
+CFRunLoop {
+
+	//1. 当前mode
+    current mode = .....
+    
+    //2. commom modes
+    common modes = {
+        UITrackingRunLoopMode
+        kCFRunLoopDefaultMode
+    }
+  
+  	//3. 所有的items source0/source1/timer/observer
+    common mode items = {
+  
+        // source0 (manual)
+        CFRunLoopSource {order =-1, {
+            callout = _UIApplicationHandleEventQueue}}
+        CFRunLoopSource {order =-1, {
+            callout = PurpleEventSignalCallback }}
+        CFRunLoopSource {order = 0, {
+            callout = FBSSerialQueueRunLoopSourceHandler}}
+  
+        // source1 (mach port)
+        CFRunLoopSource {order = 0,  {port = 17923}}
+        CFRunLoopSource {order = 0,  {port = 12039}}
+        CFRunLoopSource {order = 0,  {port = 16647}}
+        CFRunLoopSource {order =-1, {
+            callout = PurpleEventCallback}}
+        CFRunLoopSource {order = 0, {port = 2407,
+            callout = _ZL20notify_port_callbackP12__CFMachPortPvlS1_}}
+        CFRunLoopSource {order = 0, {port = 1c03,
+            callout = __IOHIDEventSystemClientAvailabilityCallback}}
+        CFRunLoopSource {order = 0, {port = 1b03,
+            callout = __IOHIDEventSystemClientQueueCallback}}
+        CFRunLoopSource {order = 1, {port = 1903,
+            callout = __IOMIGMachPortPortCallback}}
+  
+        // Ovserver
+        CFRunLoopObserver {order = -2147483647, activities = 0x1, // Entry
+            callout = _wrapRunLoopWithAutoreleasePoolHandler}
+        CFRunLoopObserver {order = 0, activities = 0x20,          // BeforeWaiting
+            callout = _UIGestureRecognizerUpdateObserver}
+        CFRunLoopObserver {order = 1999000, activities = 0xa0,    // BeforeWaiting | Exit
+            callout = _afterCACommitHandler}
+        CFRunLoopObserver {order = 2000000, activities = 0xa0,    // BeforeWaiting | Exit
+            callout = _ZN2CA11Transaction17observer_callbackEP19__CFRunLoopObservermPv}
+        CFRunLoopObserver {order = 2147483647, activities = 0xa0, // BeforeWaiting | Exit
+            callout = _wrapRunLoopWithAutoreleasePoolHandler}
+  
+        // Timer
+        CFRunLoopTimer {firing = No, interval = 3.1536e+09, tolerance = 0,
+            next fire date = 453098071 (-4421.76019 @ 96223387169499),
+            callout = _ZN2CAL14timer_callbackEP16__CFRunLoopTimerPv (QuartzCore.framework)}
+    },
+  
+  	//4. 所有的运行模式modes
+    modes ＝ {
+    
+    	// 4.1 UITrackingRunLoopMode
+        CFRunLoopMode  {
+            sources0 =  { /* same as 'common mode items' */ },
+            sources1 =  { /* same as 'common mode items' */ },
+            observers = { /* same as 'common mode items' */ },
+            timers =    { /* same as 'common mode items' */ },
+        },
+  		
+  		
+  		// 4.2 GSEventReceiveRunLoopMode
+        CFRunLoopMode  {
+            sources0 =  { /* same as 'common mode items' */ },
+            sources1 =  { /* same as 'common mode items' */ },
+            observers = { /* same as 'common mode items' */ },
+            timers =    { /* same as 'common mode items' */ },
+        },
+  
+  		// 4.3 kCFRunLoopDefaultMode
+        CFRunLoopMode  {
+            sources0 = {
+                CFRunLoopSource {order = 0, {
+                    callout = FBSSerialQueueRunLoopSourceHandler}}
+            },
+            sources1 = (null),
+            observers = {
+                CFRunLoopObserver >{activities = 0xa0, order = 2000000,
+                    callout = _ZN2CA11Transaction17observer_callbackEP19__CFRunLoopObservermPv}
+            )},
+            timers = (null),
+        },
+  	
+  		// 4.4 UIInitializationRunLoopMode
+        CFRunLoopMode  {
+            sources0 = {
+                CFRunLoopSource {order = -1, {
+                    callout = PurpleEventSignalCallback}}
+            },
+            sources1 = {
+                CFRunLoopSource {order = -1, {
+                    callout = PurpleEventCallback}}
+            },
+            observers = (null),
+            timers = (null),
+        },
+         
+       //4.5 kCFRunLoopCommonModes
+        CFRunLoopMode  {
+            sources0 = ....,
+            sources1 = .....,
+            observers = .....,
+            timers = ......,
+        }
+    }
+}
+```
+
+- (1) RunLoop刚创建的时候处于的模式
+
+```
+current mode = UIInitializationRunLoopMode
+```
+
+启动完成后就不再使用`UIInitializationRunLoopMode `，其他大部分时刻都处于`kCFRunLoopDefaultMode`
+
+- (2) RunLoop刚创建的时候 commom modes 包含两种 mode
+
+```
+0 : <CFString 0x10684b210 [0x107f02a40]>{contents = "UITrackingRunLoopMode"}
+2 : <CFString 0x107f235e0 [0x107f02a40]>{contents = "kCFRunLoopDefaultMode"}
+```
+
+- (3) `UITrackingRunLoopMode`对应的runloop mode下有如下几个重要的observer
+
+```c
+repeats = Yes, order = -2147483647, callout = _wrapRunLoopWithAutoreleasePoolHandler
+```
+
+```c
+repeats = Yes, order = 2147483647, callout = _wrapRunLoopWithAutoreleasePoolHandler
+```
+
+看到上面两个observer都是回调执行`_wrapRunLoopWithAutoreleasePoolHandler()`函数实现，可以参看`_wrapRunLoopWithAutoreleasePoolHandler()`的函数实现，就可以发现这两个observer在`不同的runloop状态`时回调执行，那么理所当然做不同的事情:
+
+第一个 Observer 监视的事件是 `Entry(即将进入Loop)`，其回调内会调用 `_objc_autoreleasePoolPush()` 用来`创建自动释放池`。其 order 是-2147483647，`优先级最高`，保证创建释放池发生在其他所有回调之前。
+
+
+第二个 Observer 监视了两个事件: `BeforeWaiting(准备进入休眠)` 时调用`_objc_autoreleasePoolPop()` 和 `_objc_autoreleasePoolPush()` 释放旧的池并创建新池；`Exit(即将退出Loop)` 时调用 `_objc_autoreleasePoolPop()` 来释放自动释放池。这个 Observer 的 order 是 2147483647，`优先级最低`，保证其释放池子发生在其他所有回调之后。
+
+- (4) `GSEventReceiveRunLoopMode`用于接收事件的模式，这个mode是内部使用的
+
+- (5) `kCFRunLoopCommonModes`默认情况下，里面不存在任何的事件
+
+```
+sources0 = (null),
+sources1 = (null),
+observers = (null),
+timers = (null),
+```
+
+还可以看到其他的runloop observer:
+
+- (1) 用于UI事件响应 `_UIApplicationHandleEventQueue`
+- (2) 用于手势识别 `_UIGestureRecognizerUpdateObserver`
+- (3) 用于界面更新 `_ZN2CA11Transaction17observer_callbackEP19__CFRunLoopObservermPv`，这个函数里会遍历所有待处理的 UIView/CAlayer 以执行实际的绘制和调整，并更新 UI 界面
+
+
+****
+
+##一个`RunLoop`与一个`线程`之间是一一对应的
+
+CFRunLoopRef和NSRunLoop其实是等价的，只是两个不同平台语言实现版本，他们的层级结构几乎是等价的，所以后续随便使用哪一个平台的代码都可以的。
+
+- (1) 苹果没有给出任何api直接创建一个RunLoop对象
+- (2) 只能通过如下api获取得到`由系统创建`好的RunLoop对象
+	- `[NSRunLoop currentRunLoop]`、`[NSRunLoop mainRunLoop]`
+	- `CFRunLoopGetCurrent()`、`CFRunLoopGetMain()`
+
+由于CF（CoreFoundation）版本的代码大部分几乎都是开源的，所以可以查看到CFRunLoopRef上面两个获取RunLoop对象的方法实现源码:
+
+```c
+/// 全局的Dictionary，key 是 pthread_t， value 是 CFRunLoopRef
+static CFMutableDictionaryRef loopsDic;
+
+/// 访问 loopsDic缓存时的 多线程进行同步顺序控制的 锁
+static CFSpinLock_t loopsLock;
+  
+/// 获取一个 pthread 对应的 RunLoop。
+CFRunLoopRef _CFRunLoopGet(pthread_t thread) {
+
+	/// 加锁同步
+    OSSpinLockLock(&loopsLock);
+     
+    if (!loopsDic) {
+        // 第一次进入时，初始化全局Dic，并先为主线程创建一个 RunLoop。
+        loopsDic = CFDictionaryCreateMutable();
+        CFRunLoopRef mainLoop = _CFRunLoopCreate();
+        CFDictionarySetValue(loopsDic, pthread_main_thread_np(), mainLoop);
+    }
+     
+    /// 直接从 Dictionary 里获取。
+    CFRunLoopRef loop = CFDictionaryGetValue(loopsDic, thread));
+     
+    if (!loop) {
+        /// 取不到时，创建一个新的RunLoop，注意这个方法前面是带有`_`的，所以说是内部私有方法
+        loop = _CFRunLoopCreate();
+        
+        /// 使用缓存字典进行缓存
+        CFDictionarySetValue(loopsDic, thread, loop);
+        
+        /// 注册一个回调，当线程销毁时，顺便也销毁其对应的 RunLoop。
+        _CFSetTSD(..., thread, loop, __CFFinalizeRunLoop);
+    }
+     
+    // 释放锁 
+    OSSpinLockUnLock(&loopsLock);
+    
+    return loop;
+}
+```
+  
+```c
+CFRunLoopRef CFRunLoopGetMain() {
+    return _CFRunLoopGet(pthread_main_thread_np());
+}
+  
+CFRunLoopRef CFRunLoopGetCurrent() {
+    return _CFRunLoopGet(pthread_self());
+}
+```
+
+从上面的`_CFRunLoopGet()`函数实现可以明白:
+
+- (1) 线程Thread 和 运行循环RunLoop 完全是不同的东西，但是二者之间又是一一对应的。
+
+- (2) `开启`了RunLoop对象的线程Thread对象，就可以成为`常驻后台`线程，不断的接收事件通知线程处理。还要不主动退出RunLoop和超时情况下，其RunLoop会一直运行。
+
+- (3) 而如果`没有开启`RunLoop对象的线程Thread对象，就是`一次性`线程:
+	- 只能执行一次任何
+	- 任务执行完毕就会退出执行（`while(1){}除外`）
+
+- (4) 线程对象 `刚创建时` 并没有 RunLoop，如果不去主动获取RunLoop对象，那RunLoop对象一直都不会创建。
+
+- (5) RunLoop对象 的`创建`是发生在`第一次获取`时，RunLoop对象 的`销毁`是发生在`线程结束`时。
+
+- (6) 只能处于在指定线程时，才能获取指定线程的 RunLoop对象。但是`主线程`的RunLoop对象 是可以在`任意线程`上进行获取。
+
+
+****
+
+##如果没有搞清楚RunLoop，那么经常会遇到如下问题不知道什么原因引起的
+
+- (1) 注册了一个NSTimer执行重复性代码，但是有的时候（UI点击事件、UIScrollView滚动...等等UI操作）`不会执行`
+
+- (2) `[self performSelector:<#(SEL)#> withObject:<#(id)#> withObject:<#(id)#>]` 其实也是利用了`NSTimer注册到RunLoop`
+
+对于问题(1)，产生的原因:
+
+- (1) 主线程的runloop定义了 `UI事件类型` 级别最高
+- (2) 如果接收到了 `UI事件类型` ，那么会暂时停止其他类型事件接收
+
+以及解决如下:
+
+```objc
+[[NSRunLoop currentRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
+```
+
+暂时可以将`NSRunLoopCommonModes`理解为是一个`大集合`，使用这个mode就可以在UI事件源触发时，一样可以执行我们的timer事件，关于具体细节还要看后面的只是。
+
+
+问题(2)就是有些使用performSelector系列方法时，有一些是需要传递一个mode的参数的方法:
+
+```objc
+@interface NSObject (NSThreadPerformAdditions)
+
+- (void)performSelectorOnMainThread:(SEL)aSelector withObject:(nullable id)arg waitUntilDone:(BOOL)wait modes:(nullable NSArray<NSString *> *)array;
+
+// equivalent to the first method with kCFRunLoopCommonModes
+- (void)performSelectorOnMainThread:(SEL)aSelector withObject:(nullable id)arg waitUntilDone:(BOOL)wait;
+	
+- (void)performSelector:(SEL)aSelector onThread:(NSThread *)thr withObject:(nullable id)arg waitUntilDone:(BOOL)wait modes:(nullable NSArray<NSString *> *)array NS_AVAILABLE(10_5, 2_0);
+
+// equivalent to the first method with kCFRunLoopCommonModes
+- (void)performSelector:(SEL)aSelector onThread:(NSThread *)thr withObject:(nullable id)arg waitUntilDone:(BOOL)wait NS_AVAILABLE(10_5, 2_0);
+	
+- (void)performSelectorInBackground:(SEL)aSelector withObject:(nullable id)arg NS_AVAILABLE(10_5, 2_0);
+
+@end
+```
+
+根据注释，可以看到没有传递mode时，将要执行的SEL消息注册到RunLoop的`kCFRunLoopCommonModes`这个mode下的sources0数组中。
+
+
+如果将一个事件源（NSTimer/Observer/Source）添加到runloop了，但是没有执行，可能的原因:
+
+- 原因一、检查runloop是否正常运行
+- 原因二、检查runloop是否运行完之后立马又退出了
+- 原因三、事件源添加到runloop时，指定的mode是不是错误
+
+
+****
+
+###RunLoopMode、RunLoop存在几种不同的状态mode ，而不同的mode下只接收处理对应的mode类型的事件源
+
+会根据不同的mode进行`事件过滤`，只去处理这个mode下的 sources/timers/observers。
+
+- `NSDefaultRunLoopMode`: RunLoop大多时候都处于这个模式，即空闲模式。
+	- 这个模式下，Runloop会接收并处理`所有mode类型的事件源`
+	- 但是当系统产生`UI事件`时，RunLoopMode就会切换成`UITrackingRunLoopMode`模式，就会转向处理`UI事件
+	- 就会导致RunLoop之前的`NSTimer事件源`被遗弃，一直等到UI事件处理完毕
+	- 所以，如果需要NSTimer在任何时刻都需要执行，最好使用`NSRunLoopCommonModes`这个mode
+
+- `UITrackingRunLoopMode`: 系统触发`UI事件`时的模式
+	- 当手指按住UITableView拖动时就会处于此模式
+	- 为了来保证滑动事件的优先处理
+
+- `UIInitializationRunLoopMode`: 苹果自己使用的，非公开的模式，App启动时RunLoop状态
+
+- `NSRunLoopCommonModes`: 主要是组合如下几种RunLoop Mode模式下都进行工作
+	- 模式一、NSDefaultRunLoopMode 系统处于空闲
+	- 模式二、UITrackingRunLoopMode 系统产生UI事件
+
+****
+
+###RunLoop有CoreFoundation与CoacaFoundation两个平台的实现版本
+
+- CFRunLoopRef
+	- 由CoreFoundation类库提供，提供的全部都是纯C语言的Api
+	- 这些C语言的Api，都是`线程安全`的
+
+- NSRunLoop
+	- 是基于 CFRunLoopRef 的封装，提供了面向对象的 API
+	- OC的API `不是线程安全`的
+	- 所以需要避免在`其他线程`上使用`当前线程`的RunLoop
+
+Objective-C 中的一切 `可变`对象 基本上都是 `非线程安全`。CoreFoundation的RunLoop版本是`开源`的，可以参考 http://opensource.apple.com/source/CF/CF-855.17/CFRunLoop.h
+
+
+由于CF版本是开源的，所以学习时候大部分都是使用CF版本的代码，下面就去苹果的CF版本的RunLoop实现中去学习下吧.
+
+***
+
+##CoreFoundation中关于RunLoop的几个重要api
+
+- (1) `RunLoop对象`本身的抽象 >>>> `CFRunLoopRef`
+- (2) RunLoop的`运行模式`的抽象 >>> `CFRunLoopModeRef`
+- (3) 注册到RunLoop事件循环的`事件source` 的抽象 >>> `CFRunLoopSourceRef`
+- (4) 注册到RunLoop事件循环的`观察者observer` 的抽象 >>> `CFRunLoopObserverRef`
+- (5) 注册到RunLoop事件循环的`定时器timer` 的抽象 >>> `CFRunLoopTimerRef`
+
+一个RunLoop对象在内存中包含如上所有东西的组成结构:
+
+```
+- 某一个线程的RunLoop对象
+	- UIInitializationRunLoopMode(私有mode)
+		- sources0
+			- source1
+			- source2
+			- .....
+			- sourceN
+		- sources1
+			- source1
+			- source2
+			- .....
+			- sourceN
+		- timers
+			- timer1
+			- timer2
+			- ....
+			- timerN
+		- observers
+			- observer1
+			- observer2
+			- ....
+			- observerN
+	- NSDefaultRunLoopMode(大部分时间都处于这个mode)
+		- sources0
+			- source1
+			- source2
+			- .....
+			- sourceN
+		- sources1
+			- source1
+			- source2
+			- .....
+			- sourceN
+		- timers
+			- timer1
+			- timer2
+			- ....
+			- timerN
+		- observers
+			- observer1
+			- observer2
+			- ....
+			- observerN
+	- UITrackingRunLoopMode
+		- sources0
+			- source1
+			- source2
+			- .....
+			- sourceN
+		- sources1
+			- source1
+			- source2
+			- .....
+			- sourceN
+		- timers
+			- timer1
+			- timer2
+			- ....
+			- timerN
+		- observers
+			- observer1
+			- observer2
+			- ....
+			- observerN
+	- GSEventReceiveRunLoopMode(私有mode)
+		- sources0
+			- source1
+			- source2
+			- .....
+			- sourceN
+		- sources1
+			- source1
+			- source2
+			- .....
+			- sourceN
+		- timers
+			- timer1
+			- timer2
+			- ....
+			- timerN
+		- observers
+			- observer1
+			- observer2
+			- ....
+			- observerN
+	- kCFRunLoopCommonModes(组合mode)
+		- sources0
+			- source1
+			- source2
+			- .....
+			- sourceN
+		- sources1
+			- source1
+			- source2
+			- .....
+			- sourceN
+		- timers
+			- timer1
+			- timer2
+			- ....
+			- timerN
+		- observers
+			- observer1
+			- observer2
+			- ....
+			- observerN
+```
+
+OK，先有个轮廓，然后一一再查看。
+
+****
+
+##CFRunLoopRef描述一个runloop对象本身，封装了事件循环的处理功能
+
+CoreFoundation中的代码结构定义:
+
+```objc
+typedef struct CF_BRIDGED_MUTABLE_TYPE(id) __CFRunLoop * CFRunLoopRef
+```
+
+```c
+struct __CFRunLoop {
+    CFRuntimeBase _base;
+    pthread_mutex_t _lock;			/* locked for accessing mode list */
+    
+    // 【重要】接收事件的Port
+    __CFPort _wakeUpPort;			// used for CFRunLoopWakeUp 
+    
+    Boolean _unused;
+    volatile _per_run_data *_perRunData;              // reset for runs of the run loop
+    
+    // 【重要】RunLoop对应的线程对象
+    pthread_t _pthread;
+    
+    uint32_t _winthread;
+    
+    // 【重要】组合在NSRunLoopCommomModes中的其他子mode
+    CFMutableSetRef _commonModes;
+    
+    // 【重要】NSRunLoopCommomModes下的 timers/observers/sources
+    CFMutableSetRef _commonModeItems;
+    
+    // 【重要】当前RunLoop对象的雨欣模式
+    CFRunLoopModeRef _currentMode;
+    
+    // 【重要】RunLoop注册的所有运行模式
+    CFMutableSetRef _modes;
+    
+    struct _block_item *_blocks_head;
+    struct _block_item *_blocks_tail;
+    CFAbsoluteTime _runTime;
+    CFAbsoluteTime _sleepTime;
+    CFTypeRef _counterpart;
+};
+```
+
+Foundation版本
+
+```objc
+NSRunLoop
+```
+
+runloop源码中暴露的开启runloop的函数实现:
+
+```c
+void CFRunLoopRun(void) {	/* DOES CALLOUT */
+    int32_t result;
+    
+    do {
+        result = CFRunLoopRunSpecific(CFRunLoopGetCurrent(), kCFRunLoopDefaultMode, 1.0e10, false);
+        CHECK_FOR_FORK();
+    } while (kCFRunLoopRunStopped != result && kCFRunLoopRunFinished != result);
+}
+```
+
+可以看到该函数开启了一个`do-wihile(条件){}` 一个死循环，然后不断的执行`CFRunLoopRunSpecific()`这个c函数实现，而结束执行的条件就是`result == kCFRunLoopRunStopped or result == kCFRunLoopRunFinished`，也就是runloop停止运行或结束运行。
+
+> 但是我就有一个疑问，这样一个死循环会不会导致线程的卡顿了？我想结果肯定是不会，要不然怎么可能使用了，看苹果文档描述说runloop和线程并不是一个东西，但是之间却是有联系的。具体不太清楚，后续学习明白之后再回头补。
+
+再看看上面调用的启动runloop函数实现:
+
+```c
+SInt32 CFRunLoopRunSpecific(CFRunLoopRef rl, CFStringRef modeName, CFTimeInterval seconds, Boolean returnAfterSourceHandled) {     /* DOES CALLOUT */
+    CHECK_FOR_FORK();
+    if (__CFRunLoopIsDeallocating(rl)) return kCFRunLoopRunFinished;
+    __CFRunLoopLock(rl);
+    
+    // 根据传入的CFStringRef mode 字符串，找到CFRunLoopModeRef实例
+    CFRunLoopModeRef currentMode = __CFRunLoopFindMode(rl, modeName, false);
+    
+    // 如果mode下不存在 sources/timers/observers
+    if (NULL == currentMode || __CFRunLoopModeIsEmpty(rl, currentMode, rl->_currentMode)) {
+		Boolean did = false;
+		if (currentMode) __CFRunLoopModeUnlock(currentMode);
+		__CFRunLoopUnlock(rl);
+		
+		// runloop正在处理事件 or runloop结束执行
+		return did ? kCFRunLoopRunHandledSource : kCFRunLoopRunFinished;
+    }
+    
+    // 切换runloop为传入的mode
+    volatile _per_run_data *previousPerRun = __CFRunLoopPushPerRunData(rl);
+    CFRunLoopModeRef previousMode = rl->_currentMode;
+    rl->_currentMode = currentMode;
+    int32_t result = kCFRunLoopRunFinished;
+
+	// 告诉所有的observer，runloop开始执行了
+	if (currentMode->_observerMask & kCFRunLoopEntry ) __CFRunLoopDoObservers(rl, currentMode, kCFRunLoopEntry);
+	
+	// 继续调用私有函数真正启动runloop
+	result = __CFRunLoopRun(rl, currentMode, seconds, returnAfterSourceHandled, previousMode);
+	
+	// 告诉所有的observer，runloop即将执行结束
+	if (currentMode->_observerMask & kCFRunLoopExit ) __CFRunLoopDoObservers(rl, currentMode, kCFRunLoopExit);
+	
+    __CFRunLoopModeUnlock(currentMode);
+    __CFRunLoopPopPerRunData(rl, previousPerRun);
+	rl->_currentMode = previousMode;
+    __CFRunLoopUnlock(rl);
+    return result;
+}
+```
+
+接着继续看`__CFRunLoopRun()`最终负责开启runloop的函数实现:
+
+```c
+static int32_t __CFRunLoopRun(CFRunLoopRef rl, CFRunLoopModeRef rlm, CFTimeInterval seconds, Boolean stopAfterHandle, CFRunLoopModeRef previousMode) {
+
+	// 记录开始时间
+    uint64_t startTSR = mach_absolute_time();
+
+	// runloop是否已经结束运行
+    if (__CFRunLoopIsStopped(rl)) {
+        __CFRunLoopUnsetStopped(rl);
+	return kCFRunLoopRunStopped;
+    } else if (rlm->_stopped) {
+		rlm->_stopped = false;
+		return kCFRunLoopRunStopped;
+    }
+    
+    // 
+    mach_port_name_t dispatchPort = MACH_PORT_NULL;
+    Boolean libdispatchQSafe = pthread_main_np() && ((HANDLE_DISPATCH_ON_BASE_INVOCATION_ONLY && NULL == previousMode) || (!HANDLE_DISPATCH_ON_BASE_INVOCATION_ONLY && 0 == _CFGetTSD(__CFTSDKeyIsInGCDMainQ)));
+    if (libdispatchQSafe && (CFRunLoopGetMain() == rl) && CFSetContainsValue(rl->_commonModes, rlm->_name)) dispatchPort = _dispatch_get_main_queue_port_4CF();
+    
+#if USE_DISPATCH_SOURCE_FOR_TIMERS
+    mach_port_name_t modeQueuePort = MACH_PORT_NULL;
+    if (rlm->_queue) {
+        modeQueuePort = _dispatch_runloop_root_queue_get_port_4CF(rlm->_queue);
+        if (!modeQueuePort) {
+            CRASH("Unable to get port for run loop mode queue (%d)", -1);
+        }
+    }
+#endif
+    
+    dispatch_source_t timeout_timer = NULL;
+    struct __timeout_context *timeout_context = (struct __timeout_context *)malloc(sizeof(*timeout_context));
+    if (seconds <= 0.0) { // instant timeout
+        seconds = 0.0;
+        timeout_context->termTSR = 0ULL;
+    } else if (seconds <= TIMER_INTERVAL_LIMIT) {
+	dispatch_queue_t queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, DISPATCH_QUEUE_OVERCOMMIT);
+	timeout_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
+        dispatch_retain(timeout_timer);
+	timeout_context->ds = timeout_timer;
+	timeout_context->rl = (CFRunLoopRef)CFRetain(rl);
+	timeout_context->termTSR = startTSR + __CFTimeIntervalToTSR(seconds);
+	dispatch_set_context(timeout_timer, timeout_context); // source gets ownership of context
+	dispatch_source_set_event_handler_f(timeout_timer, __CFRunLoopTimeout);
+        dispatch_source_set_cancel_handler_f(timeout_timer, __CFRunLoopTimeoutCancel);
+        uint64_t ns_at = (uint64_t)((__CFTSRToTimeInterval(startTSR) + seconds) * 1000000000ULL);
+        dispatch_source_set_timer(timeout_timer, dispatch_time(1, ns_at), DISPATCH_TIME_FOREVER, 1000ULL);
+        dispatch_resume(timeout_timer);
+    } else { // infinite timeout
+        seconds = 9999999999.0;//runloop默认的超时时间
+        timeout_context->termTSR = UINT64_MAX;
+    }
+
+    Boolean didDispatchPortLastTime = true;
+    int32_t retVal = 0;
+    do {
+        uint8_t msg_buffer[3 * 1024];
+#if DEPLOYMENT_TARGET_MACOSX || DEPLOYMENT_TARGET_EMBEDDED || DEPLOYMENT_TARGET_EMBEDDED_MINI
+        mach_msg_header_t *msg = NULL;
+        mach_port_t livePort = MACH_PORT_NULL;
+#elif DEPLOYMENT_TARGET_WINDOWS
+        HANDLE livePort = NULL;
+        Boolean windowsMessageReceived = false;
+#endif
+	__CFPortSet waitSet = rlm->_portSet;
+
+        __CFRunLoopUnsetIgnoreWakeUps(rl);
+
+        if (rlm->_observerMask & kCFRunLoopBeforeTimers) __CFRunLoopDoObservers(rl, rlm, kCFRunLoopBeforeTimers);
+        if (rlm->_observerMask & kCFRunLoopBeforeSources) __CFRunLoopDoObservers(rl, rlm, kCFRunLoopBeforeSources);
+
+	__CFRunLoopDoBlocks(rl, rlm);
+
+        Boolean sourceHandledThisLoop = __CFRunLoopDoSources0(rl, rlm, stopAfterHandle);
+        if (sourceHandledThisLoop) {
+            __CFRunLoopDoBlocks(rl, rlm);
+	}
+
+        Boolean poll = sourceHandledThisLoop || (0ULL == timeout_context->termTSR);
+
+        if (MACH_PORT_NULL != dispatchPort && !didDispatchPortLastTime) {
+#if DEPLOYMENT_TARGET_MACOSX || DEPLOYMENT_TARGET_EMBEDDED || DEPLOYMENT_TARGET_EMBEDDED_MINI
+            msg = (mach_msg_header_t *)msg_buffer;
+            if (__CFRunLoopServiceMachPort(dispatchPort, &msg, sizeof(msg_buffer), &livePort, 0)) {
+                goto handle_msg;
+            }
+#elif DEPLOYMENT_TARGET_WINDOWS
+            if (__CFRunLoopWaitForMultipleObjects(NULL, &dispatchPort, 0, 0, &livePort, NULL)) {
+                goto handle_msg;
+            }
+#endif
+        }
+
+        didDispatchPortLastTime = false;
+
+	if (!poll && (rlm->_observerMask & kCFRunLoopBeforeWaiting)) __CFRunLoopDoObservers(rl, rlm, kCFRunLoopBeforeWaiting);
+	__CFRunLoopSetSleeping(rl);
+	// do not do any user callouts after this point (after notifying of sleeping)
+
+        // Must push the local-to-this-activation ports in on every loop
+        // iteration, as this mode could be run re-entrantly and we don't
+        // want these ports to get serviced.
+
+        __CFPortSetInsert(dispatchPort, waitSet);
+        
+	__CFRunLoopModeUnlock(rlm);
+	__CFRunLoopUnlock(rl);
+
+#if DEPLOYMENT_TARGET_MACOSX || DEPLOYMENT_TARGET_EMBEDDED || DEPLOYMENT_TARGET_EMBEDDED_MINI
+#if USE_DISPATCH_SOURCE_FOR_TIMERS
+        do {
+            if (kCFUseCollectableAllocator) {
+                objc_clear_stack(0);
+                memset(msg_buffer, 0, sizeof(msg_buffer));
+            }
+            msg = (mach_msg_header_t *)msg_buffer;
+            __CFRunLoopServiceMachPort(waitSet, &msg, sizeof(msg_buffer), &livePort, poll ? 0 : TIMEOUT_INFINITY);
+            
+            if (modeQueuePort != MACH_PORT_NULL && livePort == modeQueuePort) {
+                // Drain the internal queue. If one of the callout blocks sets the timerFired flag, break out and service the timer.
+                while (_dispatch_runloop_root_queue_perform_4CF(rlm->_queue));
+                if (rlm->_timerFired) {
+                    // Leave livePort as the queue port, and service timers below
+                    rlm->_timerFired = false;
+                    break;
+                } else {
+                    if (msg && msg != (mach_msg_header_t *)msg_buffer) free(msg);
+                }
+            } else {
+                // Go ahead and leave the inner loop.
+                break;
+            }
+        } while (1);
+#else
+        if (kCFUseCollectableAllocator) {
+            objc_clear_stack(0);
+            memset(msg_buffer, 0, sizeof(msg_buffer));
+        }
+        msg = (mach_msg_header_t *)msg_buffer;
+        __CFRunLoopServiceMachPort(waitSet, &msg, sizeof(msg_buffer), &livePort, poll ? 0 : TIMEOUT_INFINITY);
+#endif
+        
+        
+#elif DEPLOYMENT_TARGET_WINDOWS
+        // Here, use the app-supplied message queue mask. They will set this if they are interested in having this run loop receive windows messages.
+        __CFRunLoopWaitForMultipleObjects(waitSet, NULL, poll ? 0 : TIMEOUT_INFINITY, rlm->_msgQMask, &livePort, &windowsMessageReceived);
+#endif
+        
+        __CFRunLoopLock(rl);
+        __CFRunLoopModeLock(rlm);
+
+        // Must remove the local-to-this-activation ports in on every loop
+        // iteration, as this mode could be run re-entrantly and we don't
+        // want these ports to get serviced. Also, we don't want them left
+        // in there if this function returns.
+
+        __CFPortSetRemove(dispatchPort, waitSet);
+        
+        __CFRunLoopSetIgnoreWakeUps(rl);
+
+        // user callouts now OK again
+	__CFRunLoopUnsetSleeping(rl);
+	if (!poll && (rlm->_observerMask & kCFRunLoopAfterWaiting)) __CFRunLoopDoObservers(rl, rlm, kCFRunLoopAfterWaiting);
+
+        handle_msg:;
+        __CFRunLoopSetIgnoreWakeUps(rl);
+
+#if DEPLOYMENT_TARGET_WINDOWS
+        if (windowsMessageReceived) {
+            // These Win32 APIs cause a callout, so make sure we're unlocked first and relocked after
+            __CFRunLoopModeUnlock(rlm);
+	    __CFRunLoopUnlock(rl);
+
+            if (rlm->_msgPump) {
+                rlm->_msgPump();
+            } else {
+                MSG msg;
+                if (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE | PM_NOYIELD)) {
+                    TranslateMessage(&msg);
+                    DispatchMessage(&msg);
+                }
+            }
+            
+            __CFRunLoopLock(rl);
+	    __CFRunLoopModeLock(rlm);
+ 	    sourceHandledThisLoop = true;
+            
+            // To prevent starvation of sources other than the message queue, we check again to see if any other sources need to be serviced
+            // Use 0 for the mask so windows messages are ignored this time. Also use 0 for the timeout, because we're just checking to see if the things are signalled right now -- we will wait on them again later.
+            // NOTE: Ignore the dispatch source (it's not in the wait set anymore) and also don't run the observers here since we are polling.
+            __CFRunLoopSetSleeping(rl);
+            __CFRunLoopModeUnlock(rlm);
+            __CFRunLoopUnlock(rl);
+            
+            __CFRunLoopWaitForMultipleObjects(waitSet, NULL, 0, 0, &livePort, NULL);
+            
+            __CFRunLoopLock(rl);
+            __CFRunLoopModeLock(rlm);            
+            __CFRunLoopUnsetSleeping(rl);
+            // If we have a new live port then it will be handled below as normal
+        }
+        
+        
+#endif
+        if (MACH_PORT_NULL == livePort) {
+            CFRUNLOOP_WAKEUP_FOR_NOTHING();
+            // handle nothing
+        } else if (livePort == rl->_wakeUpPort) {
+            CFRUNLOOP_WAKEUP_FOR_WAKEUP();
+            // do nothing on Mac OS
+#if DEPLOYMENT_TARGET_WINDOWS
+            // Always reset the wake up port, or risk spinning forever
+            ResetEvent(rl->_wakeUpPort);
+#endif
+        }
+#if USE_DISPATCH_SOURCE_FOR_TIMERS
+        else if (modeQueuePort != MACH_PORT_NULL && livePort == modeQueuePort) {
+            CFRUNLOOP_WAKEUP_FOR_TIMER();
+            if (!__CFRunLoopDoTimers(rl, rlm, mach_absolute_time())) {
+                // Re-arm the next timer, because we apparently fired early
+                __CFArmNextTimerInMode(rlm, rl);
+            }
+        }
+#endif
+#if USE_MK_TIMER_TOO
+        else if (rlm->_timerPort != MACH_PORT_NULL && livePort == rlm->_timerPort) {
+            CFRUNLOOP_WAKEUP_FOR_TIMER();
+            // On Windows, we have observed an issue where the timer port is set before the time which we requested it to be set. For example, we set the fire time to be TSR 167646765860, but it is actually observed firing at TSR 167646764145, which is 1715 ticks early. The result is that, when __CFRunLoopDoTimers checks to see if any of the run loop timers should be firing, it appears to be 'too early' for the next timer, and no timers are handled.
+            // In this case, the timer port has been automatically reset (since it was returned from MsgWaitForMultipleObjectsEx), and if we do not re-arm it, then no timers will ever be serviced again unless something adjusts the timer list (e.g. adding or removing timers). The fix for the issue is to reset the timer here if CFRunLoopDoTimers did not handle a timer itself. 9308754
+            if (!__CFRunLoopDoTimers(rl, rlm, mach_absolute_time())) {
+                // Re-arm the next timer
+                __CFArmNextTimerInMode(rlm, rl);
+            }
+        }
+#endif
+        else if (livePort == dispatchPort) {
+            CFRUNLOOP_WAKEUP_FOR_DISPATCH();
+            __CFRunLoopModeUnlock(rlm);
+            __CFRunLoopUnlock(rl);
+            _CFSetTSD(__CFTSDKeyIsInGCDMainQ, (void *)6, NULL);
+#if DEPLOYMENT_TARGET_WINDOWS
+            void *msg = 0;
+#endif
+            __CFRUNLOOP_IS_SERVICING_THE_MAIN_DISPATCH_QUEUE__(msg);
+            _CFSetTSD(__CFTSDKeyIsInGCDMainQ, (void *)0, NULL);
+	        __CFRunLoopLock(rl);
+	        __CFRunLoopModeLock(rlm);
+ 	        sourceHandledThisLoop = true;
+            didDispatchPortLastTime = true;
+        } else {
+            CFRUNLOOP_WAKEUP_FOR_SOURCE();
+            // Despite the name, this works for windows handles as well
+            CFRunLoopSourceRef rls = __CFRunLoopModeFindSourceForMachPort(rl, rlm, livePort);
+            if (rls) {
+#if DEPLOYMENT_TARGET_MACOSX || DEPLOYMENT_TARGET_EMBEDDED || DEPLOYMENT_TARGET_EMBEDDED_MINI
+		mach_msg_header_t *reply = NULL;
+		sourceHandledThisLoop = __CFRunLoopDoSource1(rl, rlm, rls, msg, msg->msgh_size, &reply) || sourceHandledThisLoop;
+		if (NULL != reply) {
+		    (void)mach_msg(reply, MACH_SEND_MSG, reply->msgh_size, 0, MACH_PORT_NULL, 0, MACH_PORT_NULL);
+		    CFAllocatorDeallocate(kCFAllocatorSystemDefault, reply);
+		}
+#elif DEPLOYMENT_TARGET_WINDOWS
+                sourceHandledThisLoop = __CFRunLoopDoSource1(rl, rlm, rls) || sourceHandledThisLoop;
+#endif
+	    }
+        } 
+#if DEPLOYMENT_TARGET_MACOSX || DEPLOYMENT_TARGET_EMBEDDED || DEPLOYMENT_TARGET_EMBEDDED_MINI
+        if (msg && msg != (mach_msg_header_t *)msg_buffer) free(msg);
+#endif
+        
+	__CFRunLoopDoBlocks(rl, rlm);
+        
+
+	if (sourceHandledThisLoop && stopAfterHandle) {
+	    retVal = kCFRunLoopRunHandledSource;
+        } else if (timeout_context->termTSR < mach_absolute_time()) {
+            retVal = kCFRunLoopRunTimedOut;
+	} else if (__CFRunLoopIsStopped(rl)) {
+            __CFRunLoopUnsetStopped(rl);
+	    retVal = kCFRunLoopRunStopped;
+	} else if (rlm->_stopped) {
+	    rlm->_stopped = false;
+	    retVal = kCFRunLoopRunStopped;
+	} else if (__CFRunLoopModeIsEmpty(rl, rlm, previousMode)) {
+	    retVal = kCFRunLoopRunFinished;
+	}
+    } while (0 == retVal);
+
+    if (timeout_timer) {
+        dispatch_source_cancel(timeout_timer);
+        dispatch_release(timeout_timer);
+    } else {
+        free(timeout_context);
+    }
+
+    return retVal;
+}
+```
+
+这段函数比较长、比较复杂...仅仅只是笔记记录下，有时间就仔细看看。
+
+上面函数中调用`__CFRunLoopModeIsEmpty()`函数判断当前runloop是否还有items（timers/sources0/sources1），如果`__CFRunLoopModeIsEmpty()`返回false，就会return结束`do()while(){}`
+
+```c
+static Boolean __CFRunLoopModeIsEmpty(CFRunLoopRef rl, CFRunLoopModeRef rlm, CFRunLoopModeRef previousMode) {
+	....
+	
+	// sources0事件items对象
+	if (NULL != rlm->_sources0 && 0 < CFSetGetCount(rlm->_sources0)) return false;
+	
+	// sources1事件items对象
+    if (NULL != rlm->_sources1 && 0 < CFSetGetCount(rlm->_sources1)) return false;
+    
+    // timer事件items对象
+    if (NULL != rlm->_timers && 0 < CFArrayGetCount(rlm->_timers)) return false;
+    
+    ....
+}
+```
+
+所以可以看到，当mode对象中的 `_sources0`、`_sources1`、`_timers`这三个集合对象都没有item子对象时，这个RunLoop对象就会退出执行。
+
+****
+
+###CFRunLoopModeRef描述了RunLoop对象的某一种`运行模式`，就像一个过滤器的标志，只会过滤出这一种模式下的timers/sources
+
+```objc
+typedef struct CF_BRIDGED_MUTABLE_TYPE(id) __CFRunLoopMode * CFRunLoopModeRef
+```
+
+```c
+struct __CFRunLoopMode {
+    CFRuntimeBase _base;
+    pthread_mutex_t _lock;	/* must have the run loop locked before locking this */
+    CFStringRef _name;
+    Boolean _stopped;
+    char _padding[3];
+    
+    // 【重要】_sources0类型的事件
+    CFMutableSetRef _sources0;
+    
+    // 【重要】_sources1类型的事件
+    CFMutableSetRef _sources1;
+    
+    // 【重要】该模式下所有的观察者
+    CFMutableArrayRef _observers;
+    
+    // 【重要】该模式下所有的计时器
+    CFMutableArrayRef _timers;
+    
+    CFMutableDictionaryRef _portToV1SourceMap;
+    __CFPortSet _portSet;
+    CFIndex _observerMask;
+#if USE_DISPATCH_SOURCE_FOR_TIMERS
+    dispatch_source_t _timerSource;
+    dispatch_queue_t _queue;
+    Boolean _timerFired; // set to true by the source when a timer has fired
+    Boolean _dispatchTimerArmed;
+#endif
+#if USE_MK_TIMER_TOO
+    mach_port_t _timerPort;
+    Boolean _mkTimerArmed;
+#endif
+#if DEPLOYMENT_TARGET_WINDOWS
+    DWORD _msgQMask;
+    void (*_msgPump)(void);
+#endif
+    uint64_t _timerSoftDeadline; /* TSR */
+    uint64_t _timerHardDeadline; /* TSR */
+};
+```
+
+可以看到mode下有两种类型的事件源:
+
+```c
+CFMutableSetRef _sources0;
+```
+
+```c
+CFMutableSetRef _sources1;
+```
+
+常见的问题就是在UI上创建了一个NSTimer对象并加入到runloop不停的调度执行，然后当执行某些UI操作时（UITableView滚动），NSTimer对象的回调不会被执行。
+
+就是运行模式mode的问题，`主线程 RunLoop` 对象的 `_modes` 里有两个预置的运行模式modes:
+
+- (1) kCFRunLoopDefaultMode、程序`大部分`时间都会处于这个模式
+- (2) UITrackingRunLoopMode、只有发生`UI事件`的时候才会处于这个模式
+
+还有一个运行模式标示为`kCFRunLoopCommonModes`对应着RunLoop对象中的`_commonModes `set集合对象:
+
+- (1) 这个`common modes`并不是runloop的真正处于的某一种mode，只是处于这个`common modes`下的timers/sources在任何mode下都会执行
+
+- (2) `kCFRunLoopDefaultMode`与`UITrackingRunLoopMode` 这两个 Mode 都已经被标记为`common modes`，并保存在`_commonModes`这个set集合对象中
+
+- (3) runloop.h也提供了将Runloop对象内部的`__CFRunLoopMode`对象添加注册到`_commonModes`set结合对象中:
+
+```c
+void CFRunLoopAddCommonMode(CFRunLoopRef rl, CFStringRef modeName);
+```
+
+注意，开发者直接没有办法去操作`__CFRunLoopMode`对象，只有通过这些`kCFRunLoopDefaultMode`、`UITrackingRunLoopMode`、`kCFRunLoopCommonModes`等等标示去间接操作RunLoop对象内部的`__CFRunLoopMode`对象.
+
+所以在默认情况下`schedule`一个Timer对象，实际上都是将这个timer事件加入到runloop对象的`kCFRunLoopDefaultMode`这个标示对于的`__CFRunLoopMode`对象内部的`_timers`数组中。
+
+当发生UI操作时，也就是主线程RunLoop对象接收到一个UI事件，接着就会将RunLoop的运行模式切换成`UITrackingRunLoopMode`对应的`__CFRunLoopMode`对象，此时也就只会处理这个`__CFRunLoopMode`对中`_timers`数组内的timer对象。
+
+所以之前在`kCFRunLoopDefaultMode`这个标示对于的`__CFRunLoopMode`对象内部的`_timers`数组中的timer对象就不在被处理，也就不会再执行了。
+
+![](http://i4.piimg.com/567571/cfb8344751587e7d.png)
+
+- (1) 一个RunLoop对象具备五种运行模式
+- (2) 当RunLoop对象处理一个事件时，会自动切换到与该事件匹配的mode模式下，这个Mode被称作`CurrentMode`
+- (3) 每一种运行模式下，都可以注册不同的 timers/observers/sources
+- (4) 当RunLoop切换到某一个mode模式下时，暂时只会处理该mode模式下的 timers/observers/sources，一直到事件处理完毕切换到其他的mode模式下
+
+***
+
+###CFRunLoopSourceRef描述一个注册到runloop接收的事件源
+
+```objc
+typedef struct CF_BRIDGED_MUTABLE_TYPE(id) __CFRunLoopSource * CFRunLoopSourceRef;
+```
+
+runloop source结构体定义如下:
+
+```c
+struct __CFRunLoopSource {
+    CFRuntimeBase _base;
+    uint32_t _bits;
+    pthread_mutex_t _lock;
+    CFIndex _order;			/* immutable */
+    
+     // 【重要】source被哪一些运行模式持有
+    CFMutableBagRef _runLoops;
+    
+     // 【重要】包含两种类型事件
+    union {
+		CFRunLoopSourceContext version0;	/* immutable, except invalidation */
+		CFRunLoopSourceContext1 version1;	/* immutable, except invalidation */
+    } _context;
+};
+```
+version0事件结构体定义
+
+```c
+typedef struct {
+    CFIndex	version;
+    void *	info;
+    const void *(*retain)(const void *info);
+    void	(*release)(const void *info);
+    CFStringRef	(*copyDescription)(const void *info);
+    Boolean	(*equal)(const void *info1, const void *info2);
+    CFHashCode	(*hash)(const void *info);
+    void	(*schedule)(void *info, CFRunLoopRef rl, CFStringRef mode);
+    void	(*cancel)(void *info, CFRunLoopRef rl, CFStringRef mode);
+    void	(*perform)(void *info);
+} CFRunLoopSourceContext;
+```
+
+version1事件结构体定义
+
+```c
+typedef struct {
+    CFIndex	version;
+    void *	info;
+    const void *(*retain)(const void *info);
+    void	(*release)(const void *info);
+    CFStringRef	(*copyDescription)(const void *info);
+    Boolean	(*equal)(const void *info1, const void *info2);
+    CFHashCode	(*hash)(const void *info);
+#if (TARGET_OS_MAC && !(TARGET_OS_EMBEDDED || TARGET_OS_IPHONE)) || (TARGET_OS_EMBEDDED || TARGET_OS_IPHONE)
+
+	// 【区别】source1 会使用 mach_port_t 这个结构
+    mach_port_t	(*getPort)(void *info);
+    void *	(*perform)(void *msg, CFIndex size, CFAllocatorRef allocator, void *info);
+#else
+    void *	(*getPort)(void *info);
+    void	(*perform)(void *info);
+#endif
+} CFRunLoopSourceContext1;
+```
+
+对比二者定义结构的区别:
+
+- source1类型事件:
+
+	- 使用到了 `mach_port_t` 这个结构实例
+	- 而这个`mach_port_t`可以用于多个线程之间的通信
+	- 所以source1可以通过持有的这个`mach_port_t`实例，向其他的线程对象主动发起通信
+	- 也就可以`主动唤醒`某个线程对象的RunLoop去处理这个事件（这个是和source0事件的根本区别）
+ 
+- source0类型事件:
+
+	- 结构体有关于`schdule`调度事件、`cancel`取消事件、`perform`执行事件的`函数实现指针`
+	- 因为都是函数指针，所以对于source0这类事件，必须是通过一些函数api操作才能生效
+	- 对于创建的这类事件对象，首先必须通过`CFRunLoopSourceSignal(source)` 将这个 Source 标记为`待处理`
+	- 然后通过`CFRunLoopWakeUp(runloop)` 唤醒RunLoop 让其处理这个事件
+
+****
+
+###CFRunLoopObserverRef描述了一个观察runloop状态改变而执行回调的对象
+
+
+```objc
+typedef struct CF_BRIDGED_MUTABLE_TYPE(id) __CFRunLoopObserver * CFRunLoopObserverRef;
+```
+
+其observer的c结构体定义
+
+```c
+struct __CFRunLoopObserver {
+    CFRuntimeBase _base;
+    pthread_mutex_t _lock;
+    
+    // 【重要】被哪一个runloop使用
+    CFRunLoopRef _runLoop;
+    CFIndex _rlCount;
+    
+    // 【重要】变化状态
+    CFOptionFlags _activities;		/* immutable */
+    CFIndex _order;			/* immutable */
+    
+    // 【重要】指定observer被runloop回调执行的函数实现
+    CFRunLoopObserverCallBack _callout;	/* immutable */
+    CFRunLoopObserverContext _context;	/* immutable, except invalidation */
+};
+```
+
+对于observer加入到runloop中整个生命周期，具备如下变化状态
+
+```c
+typedef CF_OPTIONS(CFOptionFlags, CFRunLoopActivity) {
+
+	// 即将进入Loop
+    kCFRunLoopEntry = (1UL << 0),
+    
+    // 即将处理 Timer
+    kCFRunLoopBeforeTimers = (1UL << 1),
+    
+    // 即将处理 Source
+    kCFRunLoopBeforeSources = (1UL << 2),
+    
+    // 即将进入休眠
+    kCFRunLoopBeforeWaiting = (1UL << 5),
+    
+    // 刚从休眠中唤醒
+    kCFRunLoopAfterWaiting = (1UL << 6),
+    
+    // 即将退出Loop
+    kCFRunLoopExit = (1UL << 7),
+    
+    // Mask掩码
+    kCFRunLoopAllActivities = 0x0FFFFFFFU
+};
+```
+
+RunLoop对象状态变化图示（来自YY博客文章）:
+
+![](http://i4.piimg.com/567571/cdb4164e313d96fd.png)
+
+RunLoop就是一个`do{}while()`这样的一个循环，如果条件成立会一直执行`do{}`中的代码块，而`do{}`中做的事情就是不断重复的执行上面图示的事情.
+
+第一件事、RunLoop开始执行时，通知observer执行回调。
+
+第二件事 ~ 第九件事，属于`do{}while()`循环不断执行的代码，不断的等待时间处理时间、休眠唤醒，然后通知线程对象。
+
+第十件事、RunLoop对象退出执行。RunLoop对象退出执行的情况:
+
+```c
+一、手动执行 void CFRunLoopStop(CFRunLoopRef rl); 退出runloop
+```
+
+```c
+二、Runloop对象中没有任何的 timer/source0/source1，自动退出
+```
+
+```c
+三、Runloop对象运行超时，创建RunLoop对象时，指定了默认的超时时间为 `seconds = 9999999999.0;` 
+```
+
+关于上面代码的具体实现，可以参看`__CFRunLoopRun()`函数具体实现。
+
+****
+
+###CFRunLoopTimerRef就是经常使用的NSTimer
+
+```objc
+typedef struct CF_BRIDGED_MUTABLE_TYPE(NSTimer) __CFRunLoopTimer * CFRunLoopTimerRef;
+```
+
+timer的c结构体定义
+
+```c
+struct __CFRunLoopTimer {
+    CFRuntimeBase _base;
+    uint16_t _bits;
+    pthread_mutex_t _lock;
+    
+    // 【重要】被哪一个runloop使用
+    CFRunLoopRef _runLoop;
+    CFMutableSetRef _rlModes;
+    CFAbsoluteTime _nextFireDate;
+    
+    // 【重要】timer的间隔时间
+    CFTimeInterval _interval;		/* immutable */
+    CFTimeInterval _tolerance;          /* mutable */
+    
+    uint64_t _fireTSR;			/* TSR units */
+    CFIndex _order;			/* immutable */
+    
+    // 【重要】指定timer被runloop回调执行的函数实现
+    CFRunLoopTimerCallBack _callout;	/* immutable */
+    CFRunLoopTimerContext _context;	/* immutable, except invalidation */
+};
+```
+
+***
+
+###摘录AFNetworking使用RunLoop的代码示例
+
+- 首先，必须创建一个NSThread对象作为RunLoop的载体
+
+```objc
+
+//创建一个单例子线程对象，并指定线程对象的回调函数networkRequestThreadEntryPoint:
+
++ (NSThread *)networkRequestThread {
+    
+    static NSThread *_networkRequestThread = nil;
+    static dispatch_once_t oncePredicate;
+    
+    dispatch_once(&oncePredicate, ^{
+    
+    	 //1. 
+        _networkRequestThread = [[NSThread alloc] initWithTarget:self selector:@selector(networkRequestThreadEntryPoint:) object:nil];
+        
+        //2. 创建NSThread后，一定使用start方法，才会执行thread对象
+        [_networkRequestThread start];
+    });
+
+    return _networkRequestThread;
+}
+
+```
+
+* 线程的回调函数中，开启当前Thread对象的RunLoop
+
+```objc
+
++ (void)networkRequestThreadEntryPoint:(id)__unused object {
+
+	//1. 线程入口函数，创建线程的自动释放池
+    @autoreleasepool {
+    
+    	//1.1 
+        [[NSThread currentThread] setName:@"AFNetworking"];
+
+		 //1.2 获取当前线程绑定额runloop对象
+        NSRunLoop *runLoop = [NSRunLoop currentRunLoop];
+        
+        //1.3 这一句很重要，给runloop注册一个port，可以用于不同线程或不同进行之间进行通信
+        //但是这里并没有将port发送给其他子线程，所以并不是完成线程之间的通信
+        //仅仅只是为了让runloop永远不退出
+        //而runloop不会退出，那么其绑定的线程对象也就不会退出
+        [runLoop addPort:[NSMachPort port] forMode:NSDefaultRunLoopMode];
+        
+        //1.4 开启当前线程的runloop
+        [runLoop run];
+    }
+}
+
+
+```
+
+* NSOperation被Queue调度，然后AFURLConenctionOperation的start方法被执行。start线程体方法中，让具体执行`NSURLConnection`的相关代码都在之前创建的`单例子线程的runloop`上进行调度，而`不是直接的某个线程上完成`
+
+```objc
+- (void)start {
+    [self.lock lock];
+    if ([self isCancelled]) {
+        [self performSelector:@selector(cancelConnection) onThread:[[self class] networkRequestThread] withObject:nil waitUntilDone:NO modes:[self.runLoopModes allObjects]];
+    } else if ([self isReady]) {
+        self.state = AFOperationExecutingState;
+
+        [self performSelector:@selector(operationDidStart) onThread:[[self class] networkRequestThread] withObject:nil waitUntilDone:NO modes:[self.runLoopModes allObjects]];
+    }
+    [self.lock unlock];
+}
+
+```
+
+* operationDidStart在`单例子线程的RunLoop上进行schedule调度`执行。
+	- 每一个NSURLRequest的请求，都会创建一个新的NSURLConnection实例
+	- NSURLConnection实例，是在单例线程的`runloop`上调度
+
+```objc
+- (void)operationDidStart {
+    [self.lock lock];
+    if (![self isCancelled]) {
+    
+    	//1. 创建网络连接，并指定回调函数（回调函数执行的所在线程也是子线程）
+        self.connection = [[NSURLConnection alloc] initWithRequest:self.request delegate:self startImmediately:NO];
+
+		//2. 获得当前方法所在线程对象的RunLoop
+        NSRunLoop *runLoop = [NSRunLoop currentRunLoop];
+        
+        //3. 在当前子线程对象的RunLoop上，添加调度任务 网络连接、输出流
+        for (NSString *runLoopMode in self.runLoopModes) {
+            [self.connection scheduleInRunLoop:runLoop forMode:runLoopMode];
+            [self.outputStream scheduleInRunLoop:runLoop forMode:runLoopMode];
+        }
+
+		//4. 任务开始调度
+        [self.outputStream open];
+        [self.connection start];
+    }
+    [self.lock unlock];
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[NSNotificationCenter defaultCenter] postNotificationName:AFNetworkingOperationDidStartNotification object:self];
+    });
+}
+
+```
+
+- iOS系统线程完成最终的CFSocket操作，网络数据获取
+
+- 然后通过注册的NSMatchPort，找到对应的RunLoop
+
+
+- `[NSMachPort port]` 牵涉到线程对象之间的通信的问题
+	- 但是AFN只是创建了一个NSMachPort对象
+	- 但是没有持有这个Port，也没有将这个Port发送给其他线程，所以就无法接收其他线程的Port消息
+	- 仅仅只是为了让Runloop一直存在一个事件源，而不让Runloop退出执行
+	- 因为runloop只要还存在需要处理的`Timers/Observers/Sources`，就不会退出执行
+
+***
+
+###之前用过Bugly的线程卡顿监控上报，但是一直想搞清楚原理，刚好手头没事拿来看看..
+
+> 学习来源: http://www.tanhao.me/code/151113.html/
+
+***
+
+###大概思路
+
+- 首先是监控主线程的runloop状态改变
+
+- 然后根据状态改变之间的时间差，来判断是否卡顿
+
+- 线程卡顿分两种
+	- 多次的小时间卡顿
+	- 单词的长时间卡顿
+
+****
+
+###先看个例子，看runloop状态改变的规律
+
+####runloop状态枚举定义
+
+```
+typedef CF_OPTIONS(CFOptionFlags, CFRunLoopActivity) {
+	// 1
+    kCFRunLoopEntry = (1UL << 0),	
+    
+    // 2
+    kCFRunLoopBeforeTimers = (1UL << 1),
+    
+    // 4
+    kCFRunLoopBeforeSources = (1UL << 2),
+    
+    // 32
+    kCFRunLoopBeforeWaiting = (1UL << 5),
+    
+    // 64
+    kCFRunLoopAfterWaiting = (1UL << 6),
+    
+    // 128
+    kCFRunLoopExit = (1UL << 7),
+    
+    // 
+    kCFRunLoopAllActivities = 0x0FFFFFFFU
+};
+```	
+
+####ViewController+监视主线程runloop状态值改变
+
+- AppDelegate中监视主线程runloop
+
+```objc
+- (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
+    
+    [[PerformanceMonitor sharedInstance] start];
+    
+    return YES;
+}
+```
+
+- 简单的ViewController代码
+
+```
+@implementation ViewController
+
+- (void)viewDidLoad
+{
+    [super viewDidLoad];
+    
+}
+
+@end
+```
+
+- 具体监控主线程runloop的代码
+
+```
+@interface PerformanceMonitor ()
+{
+    //记录监控主线程runloop的观察者
+    CFRunLoopObserverRef observer;
+    
+    //子线程计算时间差值的同步信号
+    dispatch_semaphore_t semaphore;
+    
+    //保存当前主线程runloop变化成的状态
+    CFRunLoopActivity activity;
+}
+@end
+
+@implementation PerformanceMonitor
+
++ (instancetype)sharedInstance
+{
+    static id instance = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        instance = [[self alloc] init];
+    });
+    return instance;
+}
+
+static void runLoopObserverCallBack(CFRunLoopObserverRef observer, CFRunLoopActivity activity, void *info)
+{
+    //单例对象保存当前主线程runloop的状态
+    PerformanceMonitor *moniotr = (__bridge PerformanceMonitor*)info;
+    NSLog(@"pre state = %ld", moniotr->activity);
+    
+    moniotr->activity = activity;
+    NSLog(@"after state = %ld", moniotr->activity);
+    NSLog(@"------------------------------");
+    
+    //产生一个信号量，通知子线程计算时间差，判断是否卡顿
+    dispatch_semaphore_signal(moniotr->semaphore);
+}
+
+- (void)start
+{
+    //1. 只产生一个观察者
+    if (observer)
+        return;
+    
+    //2. 初始信号为0，只有当runloop状态改变回调时才执行
+    semaphore = dispatch_semaphore_create(0);
+    
+    //3. 设置Runloop Observer的运行环境
+    CFRunLoopObserverContext context = {
+        0,
+        (__bridge void*)self,
+        NULL,
+        NULL,
+        NULL
+    };
+    
+    //4. 创建一个runloop观察者
+    //第一个参数用于分配observer对象的内存
+    //第二个参数用以设置observer所要关注的事件，详见回调函数myRunLoopObserver中注释
+    //第三个参数用于标识该observer是在第一次(NO)进入run loop时执行还是每次(YES)进入run loop处理时均执行
+    //第四个参数用于设置该observer的优先级
+    //第五个参数用于设置该observer的回调函数
+    //第六个参数用于设置该observer的运行环境
+    observer = CFRunLoopObserverCreate(kCFAllocatorDefault,
+                                       kCFRunLoopAllActivities,
+                                       YES,
+                                       0,
+                                       &runLoopObserverCallBack,
+                                       &context);
+    
+    //5. 向主线程runloop添加观察者
+    if (observer) {
+        //获取主线程runloop
+        CFRunLoopRef mainLoop = CFRunLoopGetMain();
+        
+        //向runloop添加一个观察者，并制定runloop mode
+        CFRunLoopAddObserver(mainLoop,
+                             observer,
+                             kCFRunLoopCommonModes
+                             );
+    }
+}
+
+@end
+```
+
+####App程序启动后输出如下
+
+```
+2016-03-24 15:17:15.422
+2016-03-24 15:17:15.423 PerformanceMonitor[32671:216300] pre state = 1
+2016-03-24 15:17:15.423 PerformanceMonitor[32671:216300] after state = 2
+2016-03-24 15:17:15.423 PerformanceMonitor[32671:216300] ------------------------------
+2016-03-24 15:17:15.423 PerformanceMonitor[32671:216300] pre state = 2
+2016-03-24 15:17:15.424 PerformanceMonitor[32671:216300] after state = 4
+2016-03-24 15:17:15.424 PerformanceMonitor[32671:216300] ------------------------------
+2016-03-24 15:17:15.425 PerformanceMonitor[32671:216300] pre state = 4
+2016-03-24 15:17:15.426 PerformanceMonitor[32671:216300] after state = 2
+2016-03-24 15:17:15.426 PerformanceMonitor[32671:216300] ------------------------------
+2016-03-24 15:17:15.427 PerformanceMonitor[32671:216300] pre state = 2
+2016-03-24 15:17:15.427 PerformanceMonitor[32671:216300] after state = 4
+2016-03-24 15:17:15.427 PerformanceMonitor[32671:216300] ------------------------------
+2016-03-24 15:17:15.438 PerformanceMonitor[32671:216300] pre state = 4
+2016-03-24 15:17:15.439 PerformanceMonitor[32671:216300] after state = 2
+2016-03-24 15:17:15.439 PerformanceMonitor[32671:216300] ------------------------------
+2016-03-24 15:17:15.439 PerformanceMonitor[32671:216300] pre state = 2
+2016-03-24 15:17:15.439 PerformanceMonitor[32671:216300] after state = 4
+2016-03-24 15:17:15.440 PerformanceMonitor[32671:216300] ------------------------------
+2016-03-24 15:17:15.440 PerformanceMonitor[32671:216300] pre state = 4
+2016-03-24 15:17:15.440 PerformanceMonitor[32671:216300] after state = 2
+2016-03-24 15:17:15.441 PerformanceMonitor[32671:216300] ------------------------------
+2016-03-24 15:17:15.441 PerformanceMonitor[32671:216300] pre state = 2
+2016-03-24 15:17:15.442 PerformanceMonitor[32671:216300] after state = 4
+2016-03-24 15:17:15.442 PerformanceMonitor[32671:216300] ------------------------------
+2016-03-24 15:17:15.442 PerformanceMonitor[32671:216300] pre state = 4
+2016-03-24 15:17:15.442 PerformanceMonitor[32671:216300] after state = 2
+2016-03-24 15:17:15.442 PerformanceMonitor[32671:216300] ------------------------------
+2016-03-24 15:17:15.442 PerformanceMonitor[32671:216300] pre state = 2
+2016-03-24 15:17:15.442 PerformanceMonitor[32671:216300] after state = 4
+2016-03-24 15:17:15.444 PerformanceMonitor[32671:216300] ------------------------------
+2016-03-24 15:17:15.444 PerformanceMonitor[32671:216300] pre state = 4
+2016-03-24 15:17:15.445 PerformanceMonitor[32671:216300] after state = 2
+2016-03-24 15:17:15.445 PerformanceMonitor[32671:216300] ------------------------------
+2016-03-24 15:17:15.445 PerformanceMonitor[32671:216300] pre state = 2
+2016-03-24 15:17:15.445 PerformanceMonitor[32671:216300] after state = 4
+2016-03-24 15:17:15.445 PerformanceMonitor[32671:216300] ------------------------------
+2016-03-24 15:17:15.445 PerformanceMonitor[32671:216300] pre state = 4
+2016-03-24 15:17:15.446 PerformanceMonitor[32671:216300] after state = 32
+2016-03-24 15:17:15.446 PerformanceMonitor[32671:216300] ------------------------------
+2016-03-24 15:17:15.789 PerformanceMonitor[32671:216300] pre state = 32
+2016-03-24 15:17:15.789 PerformanceMonitor[32671:216300] after state = 64
+2016-03-24 15:17:15.789 PerformanceMonitor[32671:216300] ------------------------------
+2016-03-24 15:17:15.790 PerformanceMonitor[32671:216300] pre state = 64
+2016-03-24 15:17:15.790 PerformanceMonitor[32671:216300] after state = 2
+2016-03-24 15:17:15.790 PerformanceMonitor[32671:216300] ------------------------------
+2016-03-24 15:17:15.790 PerformanceMonitor[32671:216300] pre state = 2
+2016-03-24 15:17:15.790 PerformanceMonitor[32671:216300] after state = 4
+2016-03-24 15:17:15.790 PerformanceMonitor[32671:216300] ------------------------------
+2016-03-24 15:17:15.790 PerformanceMonitor[32671:216300] pre state = 4
+2016-03-24 15:17:15.790 PerformanceMonitor[32671:216300] after state = 2
+2016-03-24 15:17:15.790 PerformanceMonitor[32671:216300] ------------------------------
+2016-03-24 15:17:15.790 PerformanceMonitor[32671:216300] pre state = 2
+2016-03-24 15:17:15.791 PerformanceMonitor[32671:216300] after state = 4
+2016-03-24 15:17:15.791 PerformanceMonitor[32671:216300] ------------------------------
+2016-03-24 15:17:15.791 PerformanceMonitor[32671:216300] pre state = 4
+2016-03-24 15:17:15.792 PerformanceMonitor[32671:216300] after state = 2
+2016-03-24 15:17:15.792 PerformanceMonitor[32671:216300] ------------------------------
+2016-03-24 15:17:15.793 PerformanceMonitor[32671:216300] pre state = 2
+2016-03-24 15:17:15.793 PerformanceMonitor[32671:216300] after state = 4
+2016-03-24 15:17:15.793 PerformanceMonitor[32671:216300] ------------------------------
+2016-03-24 15:17:15.793 PerformanceMonitor[32671:216300] pre state = 4
+2016-03-24 15:17:15.793 PerformanceMonitor[32671:216300] after state = 2
+2016-03-24 15:17:15.793 PerformanceMonitor[32671:216300] ------------------------------
+2016-03-24 15:17:15.794 PerformanceMonitor[32671:216300] pre state = 2
+2016-03-24 15:17:15.794 PerformanceMonitor[32671:216300] after state = 4
+2016-03-24 15:17:15.794 PerformanceMonitor[32671:216300] ------------------------------
+2016-03-24 15:17:15.794 PerformanceMonitor[32671:216300] pre state = 4
+2016-03-24 15:17:15.794 PerformanceMonitor[32671:216300] after state = 2
+2016-03-24 15:17:15.794 PerformanceMonitor[32671:216300] ------------------------------
+2016-03-24 15:17:15.795 PerformanceMonitor[32671:216300] pre state = 2
+2016-03-24 15:17:15.795 PerformanceMonitor[32671:216300] after state = 4
+2016-03-24 15:17:15.795 PerformanceMonitor[32671:216300] ------------------------------
+2016-03-24 15:17:15.795 PerformanceMonitor[32671:216300] pre state = 4
+2016-03-24 15:17:15.795 PerformanceMonitor[32671:216300] after state = 32
+2016-03-24 15:17:15.795 PerformanceMonitor[32671:216300] ------------------------------
+2016-03-24 15:17:16.815 PerformanceMonitor[32671:216300] pre state = 32
+2016-03-24 15:17:16.816 PerformanceMonitor[32671:216300] after state = 64
+2016-03-24 15:17:16.816 PerformanceMonitor[32671:216300] ------------------------------
+2016-03-24 15:17:16.817 PerformanceMonitor[32671:216300] pre state = 64
+2016-03-24 15:17:16.817 PerformanceMonitor[32671:216300] after state = 2
+2016-03-24 15:17:16.817 PerformanceMonitor[32671:216300] ------------------------------
+2016-03-24 15:17:16.817 PerformanceMonitor[32671:216300] pre state = 2
+2016-03-24 15:17:16.818 PerformanceMonitor[32671:216300] after state = 4
+2016-03-24 15:17:16.818 PerformanceMonitor[32671:216300] ------------------------------
+2016-03-24 15:17:16.818 PerformanceMonitor[32671:216300] pre state = 4
+2016-03-24 15:17:16.818 PerformanceMonitor[32671:216300] after state = 32
+2016-03-24 15:17:16.818 PerformanceMonitor[32671:216300] ------------------------------
+```
+
+####随便点击下屏幕，如下几种状态切换:
+
+```
+2016-03-24 15:19:54.500 PerformanceMonitor[32805:219499] pre state = 32
+2016-03-24 15:19:54.501 PerformanceMonitor[32805:219499] after state = 64
+2016-03-24 15:19:54.501 PerformanceMonitor[32805:219499] ------------------------------
+2016-03-24 15:19:54.501 PerformanceMonitor[32805:219499] pre state = 64
+2016-03-24 15:19:54.501 PerformanceMonitor[32805:219499] after state = 2
+2016-03-24 15:19:54.501 PerformanceMonitor[32805:219499] ------------------------------
+2016-03-24 15:19:54.501 PerformanceMonitor[32805:219499] pre state = 2
+2016-03-24 15:19:54.501 PerformanceMonitor[32805:219499] after state = 4
+2016-03-24 15:19:54.502 PerformanceMonitor[32805:219499] ------------------------------
+2016-03-24 15:19:54.503 PerformanceMonitor[32805:219499] pre state = 4
+2016-03-24 15:19:54.503 PerformanceMonitor[32805:219499] after state = 2
+2016-03-24 15:19:54.504 PerformanceMonitor[32805:219499] ------------------------------
+2016-03-24 15:19:54.504 PerformanceMonitor[32805:219499] pre state = 2
+2016-03-24 15:19:54.504 PerformanceMonitor[32805:219499] after state = 4
+2016-03-24 15:19:54.504 PerformanceMonitor[32805:219499] ------------------------------
+2016-03-24 15:19:54.504 PerformanceMonitor[32805:219499] pre state = 4
+2016-03-24 15:19:54.504 PerformanceMonitor[32805:219499] after state = 2
+2016-03-24 15:19:54.504 PerformanceMonitor[32805:219499] ------------------------------
+2016-03-24 15:19:54.505 PerformanceMonitor[32805:219499] pre state = 2
+2016-03-24 15:19:54.505 PerformanceMonitor[32805:219499] after state = 4
+2016-03-24 15:19:54.505 PerformanceMonitor[32805:219499] ------------------------------
+2016-03-24 15:19:54.505 PerformanceMonitor[32805:219499] pre state = 4
+2016-03-24 15:19:54.505 PerformanceMonitor[32805:219499] after state = 32
+2016-03-24 15:19:54.505 PerformanceMonitor[32805:219499] ------------------------------
+2016-03-24 15:19:54.596 PerformanceMonitor[32805:219499] pre state = 32
+2016-03-24 15:19:54.597 PerformanceMonitor[32805:219499] after state = 64
+2016-03-24 15:19:54.597 PerformanceMonitor[32805:219499] ------------------------------
+2016-03-24 15:19:54.597 PerformanceMonitor[32805:219499] pre state = 64
+2016-03-24 15:19:54.598 PerformanceMonitor[32805:219499] after state = 2
+2016-03-24 15:19:54.598 PerformanceMonitor[32805:219499] ------------------------------
+2016-03-24 15:19:54.598 PerformanceMonitor[32805:219499] pre state = 2
+2016-03-24 15:19:54.598 PerformanceMonitor[32805:219499] after state = 4
+2016-03-24 15:19:54.598 PerformanceMonitor[32805:219499] ------------------------------
+2016-03-24 15:19:54.599 PerformanceMonitor[32805:219499] pre state = 4
+2016-03-24 15:19:54.599 PerformanceMonitor[32805:219499] after state = 2
+2016-03-24 15:19:54.599 PerformanceMonitor[32805:219499] ------------------------------
+2016-03-24 15:19:54.599 PerformanceMonitor[32805:219499] pre state = 2
+2016-03-24 15:19:54.599 PerformanceMonitor[32805:219499] after state = 4
+2016-03-24 15:19:54.600 PerformanceMonitor[32805:219499] ------------------------------
+2016-03-24 15:19:54.600 PerformanceMonitor[32805:219499] pre state = 4
+2016-03-24 15:19:54.600 PerformanceMonitor[32805:219499] after state = 32
+2016-03-24 15:19:54.600 PerformanceMonitor[32805:219499] ------------------------------
+2016-03-24 15:19:55.254 PerformanceMonitor[32805:219499] pre state = 32
+2016-03-24 15:19:55.254 PerformanceMonitor[32805:219499] after state = 64
+2016-03-24 15:19:55.254 PerformanceMonitor[32805:219499] ------------------------------
+2016-03-24 15:19:55.254 PerformanceMonitor[32805:219499] pre state = 64
+2016-03-24 15:19:55.254 PerformanceMonitor[32805:219499] after state = 2
+2016-03-24 15:19:55.254 PerformanceMonitor[32805:219499] ------------------------------
+2016-03-24 15:19:55.254 PerformanceMonitor[32805:219499] pre state = 2
+2016-03-24 15:19:55.254 PerformanceMonitor[32805:219499] after state = 4
+2016-03-24 15:19:55.254 PerformanceMonitor[32805:219499] ------------------------------
+2016-03-24 15:19:55.254 PerformanceMonitor[32805:219499] pre state = 4
+2016-03-24 15:19:55.255 PerformanceMonitor[32805:219499] after state = 32
+2016-03-24 15:19:55.255 PerformanceMonitor[32805:219499] ------------------------------
+```
+
+***
+
+
+###网上找到一个关于runloop状态切换的图示
+
+![](http://i4.tietuku.cn/ede0f98e8b55ce3d.png)
+
+那么主要会出现卡顿情况的切换状态是如下两种:
+
+```
+kCFRunLoopBeforeWaiting >>> kCFRunLoopAfterWaiting
+```
+
+```
+kCFRunLoopAfterWaiting >>> kCFRunLoopBeforeSources
+```
+
+
+那下面就是主要监视主线程runloop状态是如上两种状态切换时，查看其时间差是否超过一定数值，超过数值即视为卡顿.
+
+***
+
+###编写一个单例类来封装监控主线程runloop
+
+####AppDelegate启动回调函数开始监控
+
+```objc
+@implementation AppDelegate
+
+- (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
+    
+    //启动主线程的runloop监控
+    [[PerformanceMonitor sharedInstance] start];
+    
+    return YES;
+}
+```
+
+###具体监控主线程runloop的单例类
+
+####声明辅助变量
+
+```objc
+@interface PerformanceMonitor ()
+{
+    //
+    int timeoutCount;
+    
+    //记录监控主线程runloop的观察者
+    CFRunLoopObserverRef observer;
+    
+    //子线程计算时间差值的同步信号
+    dispatch_semaphore_t semaphore;
+    
+    //保存当前主线程runloop变化成的状态
+    CFRunLoopActivity activity;
+}
+@end
+```
+
+####单例初始化
+
+```
+@implementation PerformanceMonitor
+
++ (instancetype)sharedInstance
+{
+    static id instance = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        instance = [[self alloc] init];
+    });
+    return instance;
+}
+
+@end
+```
+
+####开始检测主线程runloop
+
+```
+- (void)start
+{
+    //1. 只产生一个观察者
+    if (observer)
+        return;
+    
+    //2. 初始信号为0，只有当runloop状态改变回调时才执行
+    semaphore = dispatch_semaphore_create(0);
+    
+    //3. 设置Runloop Observer的运行环境
+    CFRunLoopObserverContext context = {
+        0,
+        (__bridge void*)self,
+        NULL,
+        NULL,
+        NULL
+    };
+    
+    //4. 创建一个runloop观察者
+    //第一个参数用于分配observer对象的内存
+    //第二个参数用以设置observer所要关注的事件，详见回调函数myRunLoopObserver中注释
+    //第三个参数用于标识该observer是在第一次(NO)进入run loop时执行还是每次(YES)进入run loop处理时均执行
+    //第四个参数用于设置该observer的优先级
+    //第五个参数用于设置该observer的回调函数
+    //第六个参数用于设置该observer的运行环境
+    observer = CFRunLoopObserverCreate(kCFAllocatorDefault,
+                                       kCFRunLoopAllActivities,
+                                       YES,
+                                       0,
+                                       &runLoopObserverCallBack,
+                                       &context);
+    
+    //5. 向主线程runloop添加观察者
+    if (observer) {
+        //获取主线程runloop
+        CFRunLoopRef mainLoop = CFRunLoopGetMain();
+        
+        //向runloop添加一个观察者，并制定runloop mode
+        CFRunLoopAddObserver(mainLoop,
+                             observer,
+                             kCFRunLoopCommonModes
+                             );
+    }
+    
+    //6. 新开一个子线程来不断的计算时间差
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        while (YES)
+        {
+            //设定等待超时时间为50ms
+//            long flag = dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);
+            long flag = dispatch_semaphore_wait(semaphore, dispatch_time(DISPATCH_TIME_NOW, 50*NSEC_PER_MSEC));
+            
+            //flag为非0表示等待超过50ms
+            if (flag != 0)
+            {
+                if (activity == kCFRunLoopBeforeSources || activity == kCFRunLoopAfterWaiting)
+                {
+                    //连续超时次数小于5，不处理为卡顿
+                    if (++timeoutCount < 5)
+                        continue;
+                    
+                    //连续超时次数大于5，就处理为卡顿
+                    [self doReport];
+                }
+            }
+            
+            //连续超过5次超时后，清零
+            timeoutCount = 0;
+        }
+    });
+}
+
+- (void)doReport {
+    //1. 得到当前造成卡顿的函数调用信息
+    //2. 上报给服务器
+    NSLog(@"有点卡顿");
+}
+```
+
+- 对于连续的短卡顿 和 一次长时间卡顿 的处理
+	- 对连续5次超过50ms的小卡顿处理
+	- 对一次长时间的卡顿250ms做出卡顿处理
+		- 将250ms分成5次等待，每次50ms
+
+
+####检测到主线程runloop状态改变的callback函数
+
+```c
+static void runLoopObserverCallBack(CFRunLoopObserverRef observer, CFRunLoopActivity activity, void *info)
+{
+    //1. 先记录当前变成的 主线程runloop的状态值
+    PerformanceMonitor *moniotr = (__bridge PerformanceMonitor*)info;
+    moniotr->activity = activity;
+    
+    //2. 再发送信号量，通知子线程进行状态切换过程的时间差值
+    dispatch_semaphore_signal(moniotr->semaphore);
+}
+```
+
+
+####停止监控
+
+```objc
+- (void)stop
+{
+    if (!observer)
+        return;
+    
+    //移除runloop观察者
+    CFRunLoopRemoveObserver(CFRunLoopGetMain(), observer, kCFRunLoopCommonModes);
+    CFRelease(observer);
+    observer = NULL;
+}
+```
+
+###RunLoop运行的伪代码逻辑、以及涉及到的RunLoop在不同状态时被系统回调执行的函数
+
+```
+/1. 通知Observers，即将进入RunLoop -- kCFRunLoopEntry
+__CFRUNLOOP_IS_CALLING_OUT_TO_AN_OBSERVER_CALLBACK_FUNCTION__(kCFRunLoopEntry);
+
+//2. Observer会创建AutoreleasePool
+_objc_autoreleasePoolPush();
+
+//3. runloop开启死循环，接收事件
+do {
+
+    /// 3.1 通知 Observers: 即将触发 Timer 回调 -- kCFRunLoopBeforeTimers
+    __CFRUNLOOP_IS_CALLING_OUT_TO_AN_OBSERVER_CALLBACK_FUNCTION__(kCFRunLoopBeforeTimers);
+    
+    /// 3.2 通知 Observers: 即将触发 Source (非基于port的，Source0) 回调 -- kCFRunLoopBeforeSources
+    __CFRUNLOOP_IS_CALLING_OUT_TO_AN_OBSERVER_CALLBACK_FUNCTION__(kCFRunLoopBeforeSources);
+    __CFRUNLOOP_IS_CALLING_OUT_TO_A_BLOCK__(block);
+
+    /// 3.3 触发 Source0 (非基于port的) 回调。
+    __CFRUNLOOP_IS_CALLING_OUT_TO_A_SOURCE0_PERFORM_FUNCTION__(source0);
+    __CFRUNLOOP_IS_CALLING_OUT_TO_A_BLOCK__(block);
+
+    /// 3.4 通知Observers，即将进入休眠 -- kCFRunLoopBeforeWaiting
+    /// 此处有Observer释放并新建AutoreleasePool:     	_objc_autoreleasePoolPop(); 		
+    _objc_autoreleasePoolPush();
+    	
+    		__CFRUNLOOP_IS_CALLING_OUT_TO_AN_OBSERVER_CALLBACK_FUNCTION__(kCFRunLoopBeforeWaiting);
+
+    /// 7. sleep to wait msg.
+    mach_msg() -> mach_msg_trap();
+
+
+    /// 8. 通知Observers，线程被唤醒 -- kCFRunLoopAfterWaiting
+    __CFRUNLOOP_IS_CALLING_OUT_TO_AN_OBSERVER_CALLBACK_FUNCTION__(kCFRunLoopAfterWaiting);
+
+    /// 9. 如果是被Timer唤醒的，回调Timer -- timer
+    __CFRUNLOOP_IS_CALLING_OUT_TO_A_TIMER_CALLBACK_FUNCTION__(timer);
+
+    /// 9. 如果是被dispatch唤醒的，执行所有调用 dispatch_async 等方法放入main queue 的 block
+    __CFRUNLOOP_IS_SERVICING_THE_MAIN_DISPATCH_QUEUE__(dispatched_block);
+
+    /// 9. 如果Runloop是被 Source1 (基于port的) 的事件唤醒了，处理这个事件 -- source1
+    __CFRUNLOOP_IS_CALLING_OUT_TO_A_SOURCE1_PERFORM_FUNCTION__(source1);
+
+
+} while (...);
+
+/// 10. 通知Observers，即将退出RunLoop
+/// 此处有Observer释放AutoreleasePool: _objc_autoreleasePoolPop();
+__CFRUNLOOP_IS_CALLING_OUT_TO_AN_OBSERVER_CALLBACK_FUNCTION__(kCFRunLoopExit);
+}
+```
+
+断点之后，可以在左侧的调用栈查看.
+
+***
+
+###MachPort、主要是使用在不同线程之间的数据通信
+
+苹果提供了NSPort、NSMachPort、NSMessagePort（后面两个继承自NSPort）这些事OC版本的，CF版本的也是一样的。
+
+之前写的一些简单使用例子代码，基于OC版本:
+
+- (1) ViewController 中按钮点击，创建一个`子线程`并传入`主线程`的port，用于子线程向主线程发送数据
+
+```objc
+@implementation ViewController
+
+//启动线程
+- (void)launchThread{
+
+    //1. 创建主线程的port（子线程通过此端口发送消息给主线程）
+    NSPort *myPort = [NSMachPort port];
+
+    //2. 设置port的代理回调对象，接收子线程发送过来的数据
+    myPort.delegate = self;
+
+    //3. 把port加入runloop，接收port消息
+    [[NSRunLoop currentRunLoop] addPort:myPort forMode:NSDefaultRunLoopMode];
+
+    //4. 启动次线程,并传入主线程的port
+    MyWorkerClass *work = [[MyWorkerClass alloc] init];
+    [NSThread detachNewThreadSelector:@selector(launchThreadWithPort:)
+                             toTarget:work
+                           withObject:myPort];
+}
+
+#pragma mark - NSPortDelegate
+
+#define kMsg1 100		// 类型一的操作标志
+#define kMsg2 101		// 类型二的操作标志
+
+/**
+ *  接收到子线程的port 消息
+ */
+- (void)handlePortMessage:(NSMessagePort*)message{
+
+    NSLog(@"接到子线程传递的消息！");
+
+    //1. 消息id
+    NSUInteger msgId = [[message valueForKeyPath:@"msgid"] integerValue];
+
+    //2. 当前主线程的port
+    NSPort *localPort = [message valueForKeyPath:@"localPort"];
+
+    //3. 接收到消息的port（来自其他线程）
+    NSPort *remotePort = [message valueForKeyPath:@"remotePort"];
+
+    if (msgId == kMsg1)
+    {
+        //向子线的port发送消息
+        [remotePort sendBeforeDate:[NSDate date]
+                             msgid:kMsg2
+                        components:nil
+                              from:localPort
+                          reserved:0];
+
+    } else if (msgId == kMsg2){
+        NSLog(@"操作2....\n");
+    }
+
+}
+
+@end
+```
+
+- (2) MyWorkerClass.m 完成创建子线程，并且开启子线程的runloop，保存主线程传入的port
+
+```objc
+#import "MyWorkerClass.h"
+
+@interface MyWorkerClass() <NSMachPortDelegate> {
+    NSPort *remotePort;
+    NSPort *myPort;
+}
+@end
+
+@implementation MyWorkerClass
+
+- (void)launchThreadWithPort:(NSPort *)port {
+
+    @autoreleasepool {
+
+        //1. 保存主线程的port
+        remotePort = port;
+
+        //2. 设置子线程名字
+        [[NSThread currentThread] setName:@"MyWorkerClassThread"];
+
+        //3. 开启runloop
+        [[NSRunLoop currentRunLoop] run];
+
+        //4. 创建自己port
+        myPort = [NSPort port];
+
+        //5. 用于接收主线程的数据回调
+        myPort.delegate = self;
+
+        //6. 将自己的port添加到runloop接收port事件
+        [[NSRunLoop currentRunLoop] addPort:myPort forMode:NSDefaultRunLoopMode];
+
+        //7. 主动向主线程port发送一条数据
+        [self sendPortMessage];
+    }
+}
+
+/**
+ *   完成向主线程发送port消息
+ */
+- (void)sendPortMessage {
+
+    //发送消息到主线程，操作1
+    [remotePort sendBeforeDate:[NSDate date]
+                         msgid:kMsg1
+                    components:nil
+                          from:myPort
+                      reserved:0];
+
+    //发送消息到主线程，操作2
+//    [remotePort sendBeforeDate:[NSDate date]
+//                         msgid:kMsg2
+//                    components:nil
+//                          from:myPort
+//                      reserved:0];
+}
+
+
+#pragma mark - NSPortDelegate
+
+/**
+ *  接收到主线程port消息
+ */
+- (void)handlePortMessage:(NSPortMessage *)message
+{
+    NSLog(@"接收到父线程的消息...\n");
+
+//    unsigned int msgid = [message msgid];
+//    NSPort* distantPort = nil;
+//    
+//    if (msgid == kCheckinMessage)
+//    {
+//        distantPort = [message sendPort];
+//        
+//    }
+//    else if(msgid == kExitMessage)
+//    {
+//        CFRunLoopStop((__bridge CFRunLoopRef)[NSRunLoop currentRunLoop]);
+//    }
+}
+
+@end
+```
+
+如上无法实现主线程向子线程发送数据，但可以这样实现:
+
+- (1) 子线程可以先向父线程发个 `特殊的消息`
+- (2) 而这个特殊消息包含，`子线程的 NSMachPort对象`
+- (3) 父线程便持有了子线程创建的NSPort对象
+- (4) 后续父线程可以通过向持有的这个NSPort对象发送消息，子线程即可接收到数据了
+
+```objc
+/**
+ 如下代码是创建一个 port消息 ，将当前子线程上对象的port，发送给父线程的port
+ 但是由于iOS7+屏蔽了使用NSPortMessage，所以如下代码会编译报错.
+ */
+- (void)sendPortMessage {
+
+	//1. 构造一个port消息，传入当前子线程对象的port
+	NSPortMessage* messageObj = [[NSPortMessage alloc] initWithSendPort:主线程对象的port
+	                                                        receivePort:当前子线程对象的port
+	//2. 设置消息的id
+	[messageObj setMsgid:kCheckinMessage];
+	
+	//3. 发送port消息
+	[messageObj sendBeforeDate:[NSDate date]];
+}
+```
+
+如上是关于 mach_port最简单的使用，在两个不同线程之间的数据通信方式，但肯定系统实现比这复杂的多。
+
+MachPort、MessagePort，在`iOS7`之后苹果不再面向开发者，因为其使用太过复杂、麻烦。
+
+苹果推荐使用如下进行线程通信:
+
+- (1) GCD DisPach Queue
+- (2) NSOperation Queue
+- (3) NSObject分类的各种的 performSelecter:onThread:…方法（不如使用上面两种）
+
+那么想总结关于mac port的核心作用:
+
+- (1) 向runloop发送消息
+- (2) 让runloop去接收消息
+
+然而实现上面两点的最终又是依赖 ` mach_msg_trap()` 函数实现:
+
+- (1) 在一个线程上，对另外一个线程的port发送消息，最终是调用`mach_msg_trap()`函数实现完成
+
+- (2) 然而`mach_msg()`函数内会做很多处理:
+	- 首先从`用户空间（当前发送port消息的线程）`切换到`系统内核空间`
+	- `系统内核`然后通知port对应的RunLoop对象开始准备接收port消息，即唤醒RunLoop对象
+	- 最后`系统内核`调用`mach_msg()`将port消息发送给指定的RunLoop对象
+
+- (3) 而当RunLoop对象处理完所有事件，有没有新的事件接收时，将RunLoop对象设置为`等待`状态
+
+***
+
+###`界面更新机制` 就是使用了 `RunLoop观察者` 来实现的.
+	
+- 在`主线程的RunLoop`添加了二个 `Observer 观察者`
+
+	- 一个`最高`优先级Observer
+		- 监听`RunLoop Entry` 状态，runloop即将进入
+		- 回调主要做的事情
+			- 创建主线程的自动释放池
+
+	- 一个`最低` 优先级Observer
+		- 监听`RunLoop  BeforeWaiting`状态，runloop将睡
+			- 首先销毁旧的自动释放池
+			- 再创建新的自动释放池
+		- 监听`RunLoop Exit 线程即将退出`状态，runloop将退出
+			- 销毁自动释放池
